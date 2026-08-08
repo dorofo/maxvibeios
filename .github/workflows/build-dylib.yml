@@ -18,12 +18,13 @@ jobs:
           SDK=$(xcrun --sdk iphoneos --show-sdk-path)
           echo "SDK=$SDK"
           clang -dynamiclib \
-            -arch arm64 \
+            -target arm64-apple-ios15.0 \
             -isysroot "$SDK" \
-            -miphoneos-version-min=15.0 \
             -fobjc-arc \
             -framework Foundation \
             -framework UIKit \
+            -framework CoreGraphics \
+            -framework QuartzCore \
             -install_name "@executable_path/Frameworks/MaxVibeBanner.dylib" \
             -o MaxVibeBanner.dylib \
             banner/MaxVibeBanner.m
