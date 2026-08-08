@@ -15,14 +15,15 @@ Download the artifact `MaxVibeBanner-dylib` (`MaxVibeBanner.dylib` + `banner_cha
 ## Inject into IPA (Windows)
 
 ```bash
-pip install lief
+pip install lief   # not required for inject anymore
 python scripts/inject_banner.py ^
   --payload-dir "C:\path\to\temp" ^
   --dylib MaxVibeBanner.dylib ^
   --png banner_character.png ^
+  --restore-from-ipa "ru.oneme.app_26.17.3_decrypted.ipa" ^
   --out-ipa ru.oneme.app_26.17.3_MaxVibe.ipa
 ```
 
-`temp` must contain `Payload/MAX.app` (already renamed/icon-patched if desired).
+`--restore-from-ipa` restores a pristine `MAX` binary before inject (important: never use LIEF rewrite — it breaks keychain/session).
 
-Install the IPA with **TrollStore** (or Sideloadly — it re-signs on install).
+Install with **TrollStore**.
