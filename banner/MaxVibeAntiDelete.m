@@ -4,15 +4,17 @@
 #import <stdarg.h>
 
 /*
- * Anti-delete v5 — UPDATE instead of DELETE (Android parity).
+ * Anti-delete v6
  *
- * Android: UPDATE messages SET text=text||'\ndeletel' ...
- * iOS Yap has no SQL messages table → equivalent is okm_saveMessage: after
- * rewriting text to "❌ "+text+"\ndeletel", and skipping the remove.
+ * Logs (v5): own "delete for all" → keep=0 allow=1 → SIGSEGV.
+ * Cause: ChatService deleteMessages* IMP trampolines (even pass-through).
  *
- * Do NOT hook _messagesUpdated / Yap setObject/remove (launch SIGABRT / SIGSEGV).
- * Do NOT read Yap from inside ChatService delete (nested tx risk).
- * ChatService hooks only skip PKs already in gDeletedPks.
+ * Fix:
+ *  - Do NOT hook OKMChatService deletes at all (own delete stays vanilla).
+ *  - Hook only OKMPushCleanupHelper _handleDeletedMessages + MessageDeleteListener.
+ *  - Incoming → tag "❌ "+\ndeletel, async okm_saveMessage: (UPDATE), skip remove.
+ *  - Discover Yap write connection by walking KVC from the helper / chatting client,
+ *    or by opening yapdb.sqlite as a last resort.
  */
 
 static NSString * const kPrefKey = @"mvibe_anti_delete_enabled";
@@ -23,11 +25,9 @@ static NSString * const kDbMarker = @"\ndeletel";
 
 static NSNumber *gMyUserId = nil;
 static NSMutableSet *gDeletedPks = nil;
-static __weak id gChatService = nil;
+static id gWriteConnection = nil; // retained YapDatabaseConnection
 
 static IMP gOrigSetUserId = NULL;
-static IMP gOrigDeletePks = NULL;
-static IMP gOrigDeletePksEnq = NULL;
 static IMP gOrigHandleDeleted = NULL;
 static IMP gOrigMessagesDeleted = NULL;
 
@@ -43,7 +43,7 @@ void MaxVibeSetAntiDeleteEnabled(BOOL enabled) {
     [[NSUserDefaults standardUserDefaults] setBool:enabled forKey:kPrefKey];
 }
 
-#pragma mark - Helpers
+#pragma mark - Log / store
 
 static void MVLog(NSString *fmt, ...) NS_FORMAT_FUNCTION(1, 2);
 static void MVLog(NSString *fmt, ...) {
@@ -76,21 +76,11 @@ static void MVRememberMyUserId(NSNumber *uid) {
     [[NSUserDefaults standardUserDefaults] setObject:uid forKey:kMyUserIdKey];
 }
 
-static void MVRememberChatService(id obj) {
-    Class chat = NSClassFromString(@"OKMChatService");
-    if (chat && obj && [obj isKindOfClass:chat]) gChatService = obj;
-}
+#pragma mark - Message helpers
 
 static BOOL MVIsOKMMessage(id obj) {
     Class cls = NSClassFromString(@"OKMMessage");
     return cls && obj && [obj isKindOfClass:cls];
-}
-
-static NSString *MVNormalizePk(id pkOrKey) {
-    if (!pkOrKey) return nil;
-    if ([pkOrKey isKindOfClass:[NSString class]]) return (NSString *)pkOrKey;
-    if ([pkOrKey respondsToSelector:@selector(stringValue)]) return [pkOrKey stringValue];
-    return [pkOrKey description];
 }
 
 static NSString *MVPkOfMessage(id msg) {
@@ -174,7 +164,6 @@ static NSString *MVStripMarkers(NSString *text) {
 
 static void MVTagMessageText(id msg) {
     NSString *base = MVStripMarkers(MVPlainTextOfMessage(msg) ?: @"");
-    // Same idea as Android: keep body + deletel marker; ❌ is the visible cue.
     NSString *tagged = [[kPrefix stringByAppendingString:base] stringByAppendingString:kDbMarker];
     MVSetPlainText(msg, tagged);
     NSString *pk = MVPkOfMessage(msg);
@@ -184,28 +173,143 @@ static void MVTagMessageText(id msg) {
     }
 }
 
-static id MVYapConnectionFrom(id host) {
-    if (!host) host = gChatService;
-    if (!host) return nil;
-    for (NSString *key in @[@"dbWriteConnection", @"_dbWriteConnection",
-                            @"writeConnection", @"_writeConnection", @"rwConnection"]) {
-        id conn = nil;
-        @try { conn = [host valueForKey:key]; } @catch (__unused NSException *e) { conn = nil; }
-        if (conn) return conn;
+#pragma mark - Yap connection discovery
+
+static BOOL MVLooksLikeWriteConnection(id obj) {
+    if (!obj) return NO;
+    return [obj respondsToSelector:NSSelectorFromString(@"asyncReadWriteWithBlock:completionBlock:")] ||
+           [obj respondsToSelector:NSSelectorFromString(@"readWriteWithBlock:")];
+}
+
+static void MVRememberConnection(id conn) {
+    if (!MVLooksLikeWriteConnection(conn)) return;
+    if (gWriteConnection != conn) {
+        gWriteConnection = conn; // strong
+        MVLog(@"got write connection %s", object_getClassName(conn));
+    }
+}
+
+static id MVKVC(id obj, NSString *key) {
+    if (!obj || !key.length) return nil;
+    @try { return [obj valueForKey:key]; } @catch (__unused NSException *ex) { return nil; }
+}
+
+static id MVFindConnectionFromSeed(id seed) {
+    if (MVLooksLikeWriteConnection(gWriteConnection)) return gWriteConnection;
+    if (!seed) return nil;
+
+    static NSArray *connKeys;
+    static NSArray *nextKeys;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        connKeys = @[
+            @"dbWriteConnection", @"_dbWriteConnection", @"writeConnection", @"_writeConnection",
+            @"rwConnection", @"_rwConnection", @"yapDatabaseConnection", @"connection"
+        ];
+        nextKeys = @[
+            @"chatService", @"_chatService", @"messengerClient", @"_messengerClient", @"client",
+            @"dependencies", @"_dependencies", @"database", @"_database", @"yapDatabase",
+            @"_yapDatabase", @"db", @"messengerCredentials", @"_messengerCredentials"
+        ];
+    });
+
+    NSMutableArray *queue = [NSMutableArray arrayWithObject:seed];
+    NSHashTable *seen = [NSHashTable hashTableWithOptions:NSPointerFunctionsWeakMemory];
+    NSUInteger steps = 0;
+    while (queue.count && steps < 40) {
+        id obj = queue.firstObject;
+        [queue removeObjectAtIndex:0];
+        if (!obj || [seen containsObject:obj]) continue;
+        [seen addObject:obj];
+        steps++;
+
+        for (NSString *k in connKeys) {
+            id c = MVKVC(obj, k);
+            if (MVLooksLikeWriteConnection(c)) {
+                MVRememberConnection(c);
+                return c;
+            }
+        }
+        id db = MVKVC(obj, @"yapDatabase");
+        if (!db) db = MVKVC(obj, @"database");
+        if (db) {
+            SEL newConn = NSSelectorFromString(@"newConnection");
+            if ([db respondsToSelector:newConn]) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+                id c = [db performSelector:newConn];
+#pragma clang diagnostic pop
+                if (MVLooksLikeWriteConnection(c)) {
+                    MVRememberConnection(c);
+                    return c;
+                }
+            }
+        }
+        for (NSString *k in nextKeys) {
+            id n = MVKVC(obj, k);
+            if (n && ![seen containsObject:n]) [queue addObject:n];
+        }
     }
     return nil;
 }
 
-/** Async UPDATE (= okm_saveMessage), never nested in the delete call stack. */
-static void MVAsyncSaveMessage(id host, id msg) {
+/** Last resort: open Library/**/yapdb.sqlite via YapDatabase. */
+static id MVOpenYapdbFallback(void) {
+    if (MVLooksLikeWriteConnection(gWriteConnection)) return gWriteConnection;
+    Class YapDatabase = NSClassFromString(@"YapDatabase");
+    if (!YapDatabase) return nil;
+
+    NSString *lib = NSSearchPathForDirectoriesInDomains(NSLibraryDirectory, NSUserDomainMask, YES).firstObject;
+    if (!lib.length) return nil;
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSDirectoryEnumerator *en = [fm enumeratorAtPath:lib];
+    NSString *rel = nil;
+    NSString *found = nil;
+    while ((rel = [en nextObject])) {
+        if ([rel.lastPathComponent isEqualToString:@"yapdb.sqlite"]) {
+            found = [lib stringByAppendingPathComponent:rel];
+            break;
+        }
+    }
+    if (!found.length) {
+        MVLog(@"yapdb.sqlite not found under Library");
+        return nil;
+    }
+    @try {
+        NSURL *url = [NSURL fileURLWithPath:found];
+        id db = ((id (*)(id, SEL, id, id))objc_msgSend)([YapDatabase alloc],
+                        NSSelectorFromString(@"initWithURL:options:"), url, nil);
+        if (!db) return nil;
+        SEL newConn = NSSelectorFromString(@"newConnection");
+        if (![db respondsToSelector:newConn]) return nil;
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+        id c = [db performSelector:newConn];
+#pragma clang diagnostic pop
+        MVRememberConnection(c);
+        MVLog(@"opened fallback yapdb %@", found);
+        return c;
+    } @catch (NSException *ex) {
+        MVLog(@"fallback yap open fail: %@", ex.name);
+        return nil;
+    }
+}
+
+static id MVResolveWriteConnection(id seed) {
+    id c = MVFindConnectionFromSeed(seed);
+    if (c) return c;
+    return MVOpenYapdbFallback();
+}
+
+static void MVAsyncSaveMessage(id seed, id msg) {
     if (!msg) return;
     id retainedMsg = msg;
-    id retainedHost = host ?: (id)gChatService;
+    id seedRet = seed;
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         @try {
-            id conn = MVYapConnectionFrom(retainedHost);
+            id conn = MVResolveWriteConnection(seedRet);
             if (!conn) {
-                MVLog(@"UPDATE skip: no write connection");
+                MVLog(@"UPDATE skip: no connection");
                 return;
             }
             void (^write)(id) = ^(id tx) {
@@ -213,7 +317,9 @@ static void MVAsyncSaveMessage(id host, id msg) {
                     SEL save = NSSelectorFromString(@"okm_saveMessage:");
                     if ([tx respondsToSelector:save]) {
                         ((void (*)(id, SEL, id))objc_msgSend)(tx, save, retainedMsg);
-                        MVLog(@"UPDATE okm_saveMessage pk=%@", MVPkOfMessage(retainedMsg));
+                        MVLog(@"UPDATE ok pk=%@", MVPkOfMessage(retainedMsg));
+                    } else {
+                        MVLog(@"UPDATE skip: no okm_saveMessage:");
                     }
                 } @catch (NSException *ex) {
                     MVLog(@"UPDATE fail: %@", ex.name);
@@ -232,70 +338,33 @@ static void MVAsyncSaveMessage(id host, id msg) {
     });
 }
 
-static void MVConvertDeleteToUpdate(id host, id msg) {
+static void MVConvertDeleteToUpdate(id seed, id msg) {
+    NSNumber *sid = MVSenderIdOfMessage(msg);
+    MVLog(@"candidate pk=%@ sender=%@ my=%@ incoming=%d",
+          MVPkOfMessage(msg), sid, gMyUserId, MVMessageIsIncoming(msg));
     if (!MVMessageIsIncoming(msg)) return;
     MVTagMessageText(msg);
-    MVLog(@"convert DELETE→UPDATE pk=%@", MVPkOfMessage(msg));
-    MVAsyncSaveMessage(host, msg);
+    MVLog(@"DELETE→UPDATE pk=%@", MVPkOfMessage(msg));
+    MVAsyncSaveMessage(seed, msg);
 }
 
-#pragma mark - Hooks
+#pragma mark - Hooks (block IMPs — no ChatService)
 
 static void mvibe_setCurrentUserId(id self, SEL _cmd, NSNumber *uid) {
     MVRememberMyUserId(uid);
     if (gOrigSetUserId) ((void (*)(id, SEL, id))gOrigSetUserId)(self, _cmd, uid);
 }
 
-/** Only skip PKs already marked — no Yap reads here. */
-static void mvibe_deleteMessagesWithPks(id self, SEL _cmd, NSArray *pks, BOOL deleteForAll) {
-    MVEnsureStore();
-    MVRememberChatService(self);
-    if (!MaxVibeAntiDeleteEnabled() || ![pks isKindOfClass:[NSArray class]] || !gOrigDeletePks) {
-        if (gOrigDeletePks) ((void (*)(id, SEL, id, BOOL))gOrigDeletePks)(self, _cmd, pks, deleteForAll);
-        return;
-    }
-    NSMutableArray *allow = [NSMutableArray array];
-    NSUInteger keep = 0;
-    for (id pk in pks) {
-        NSString *key = MVNormalizePk(pk);
-        if (key.length && [gDeletedPks containsObject:key]) {
-            keep++;
-        } else {
-            [allow addObject:pk];
-        }
-    }
-    MVLog(@"deleteMessagesWithPks total=%lu keep=%lu allow=%lu forAll=%d",
-          (unsigned long)pks.count, (unsigned long)keep, (unsigned long)allow.count, deleteForAll);
-    if (allow.count == 0) return;
-    ((void (*)(id, SEL, id, BOOL))gOrigDeletePks)(self, _cmd, allow, deleteForAll);
-}
-
-static void mvibe_deleteMessagesWithPksEnq(id self, SEL _cmd, NSArray *pks, BOOL deleteForAll, BOOL enqueueTasks) {
-    MVEnsureStore();
-    MVRememberChatService(self);
-    if (!MaxVibeAntiDeleteEnabled() || ![pks isKindOfClass:[NSArray class]] || !gOrigDeletePksEnq) {
-        if (gOrigDeletePksEnq)
-            ((void (*)(id, SEL, id, BOOL, BOOL))gOrigDeletePksEnq)(self, _cmd, pks, deleteForAll, enqueueTasks);
-        return;
-    }
-    NSMutableArray *allow = [NSMutableArray array];
-    for (id pk in pks) {
-        NSString *key = MVNormalizePk(pk);
-        if (key.length && [gDeletedPks containsObject:key]) continue;
-        [allow addObject:pk];
-    }
-    MVLog(@"_deleteMessagesWithPks total=%lu allow=%lu forAll=%d",
-          (unsigned long)pks.count, (unsigned long)allow.count, deleteForAll);
-    if (allow.count == 0) return;
-    ((void (*)(id, SEL, id, BOOL, BOOL))gOrigDeletePksEnq)(self, _cmd, allow, deleteForAll, enqueueTasks);
-}
-
 static void mvibe_handleDeletedMessages(id self, SEL _cmd, id messages, id chatId) {
     MVEnsureStore();
+    // Always try to learn a DB connection from the cleanup helper graph.
+    MVResolveWriteConnection(self);
+
     if (!MaxVibeAntiDeleteEnabled() || !gOrigHandleDeleted) {
         if (gOrigHandleDeleted) ((void (*)(id, SEL, id, id))gOrigHandleDeleted)(self, _cmd, messages, chatId);
         return;
     }
+
     NSArray *list = nil;
     if ([messages isKindOfClass:[NSArray class]]) list = messages;
     else if ([messages respondsToSelector:@selector(allObjects)]) list = [messages allObjects];
@@ -303,19 +372,21 @@ static void mvibe_handleDeletedMessages(id self, SEL _cmd, id messages, id chatI
         ((void (*)(id, SEL, id, id))gOrigHandleDeleted)(self, _cmd, messages, chatId);
         return;
     }
+
     NSMutableArray *allow = [NSMutableArray array];
     NSUInteger kept = 0;
     for (id item in list) {
         if (MVMessageIsIncoming(item)) {
             kept++;
-            // Mark PK first so a later ChatService delete skips it.
-            MVConvertDeleteToUpdate(gChatService, item);
+            MVConvertDeleteToUpdate(self, item);
         } else {
             [allow addObject:item];
         }
     }
     MVLog(@"handleDeletedMessages chat=%@ keep=%lu allow=%lu my=%@",
           chatId, (unsigned long)kept, (unsigned long)allow.count, gMyUserId);
+
+    // Own / unknown → vanilla path with ORIGINAL array when unchanged.
     if (allow.count == 0) return;
     if (allow.count == list.count) {
         ((void (*)(id, SEL, id, id))gOrigHandleDeleted)(self, _cmd, messages, chatId);
@@ -326,6 +397,7 @@ static void mvibe_handleDeletedMessages(id self, SEL _cmd, id messages, id chatI
 
 static void mvibe_messagesDeleted(id self, SEL _cmd, id messages, id chat) {
     MVEnsureStore();
+    MVResolveWriteConnection(self);
     if (!MaxVibeAntiDeleteEnabled() || !gOrigMessagesDeleted) {
         if (gOrigMessagesDeleted) ((void (*)(id, SEL, id, id))gOrigMessagesDeleted)(self, _cmd, messages, chat);
         return;
@@ -337,7 +409,7 @@ static void mvibe_messagesDeleted(id self, SEL _cmd, id messages, id chat) {
     NSMutableArray *allow = [NSMutableArray array];
     for (id item in (NSArray *)messages) {
         if (MVMessageIsIncoming(item)) {
-            MVConvertDeleteToUpdate(gChatService, item);
+            MVConvertDeleteToUpdate(self, item);
             continue;
         }
         [allow addObject:item];
@@ -367,21 +439,13 @@ void MaxVibeInstallAntiDelete(void) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         MVEnsureStore();
-        MVLog(@"install begin v5 (DELETE→UPDATE okm_saveMessage) enabled=%d",
+        MVLog(@"install begin v6 (no ChatService hooks; DELETE→UPDATE) enabled=%d",
               MaxVibeAntiDeleteEnabled());
 
         Class creds = NSClassFromString(@"OKMMessengerCredentials");
         MVLog(@"setCurrentUserId: %s",
               MVReplace(creds, NSSelectorFromString(@"setCurrentUserId:"),
                         (IMP)mvibe_setCurrentUserId, &gOrigSetUserId) ? "OK" : "FAIL");
-
-        Class chat = NSClassFromString(@"OKMChatService");
-        MVLog(@"deleteMessagesWithPks: %s",
-              MVReplace(chat, NSSelectorFromString(@"deleteMessagesWithPks:deleteForAll:"),
-                        (IMP)mvibe_deleteMessagesWithPks, &gOrigDeletePks) ? "OK" : "FAIL");
-        MVLog(@"_deleteMessagesWithPks: %s",
-              MVReplace(chat, NSSelectorFromString(@"_deleteMessagesWithPks:deleteForAll:enqueueTasks:"),
-                        (IMP)mvibe_deleteMessagesWithPksEnq, &gOrigDeletePksEnq) ? "OK" : "FAIL");
 
         Class push = NSClassFromString(@"OKMPushCleanupHelper");
         MVLog(@"_handleDeletedMessages: %s",
