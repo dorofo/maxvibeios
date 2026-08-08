@@ -4,25 +4,18 @@
 #import <stdarg.h>
 
 /*
- * Anti-delete v9 — keep it simple
+ * Anti-delete v10 — launch-safe
  *
- * Why previous versions failed:
- *  - ChatService deleteMessages* hooks → SIGSEGV on own "delete for all"
- *  - Push-only UPDATE left status=Removed(10) → UI queries hide the bubble
- *  - Calling _messagesUpdated ourselves with nil tx → unstable
+ * v9 hooked _messagesUpdated via block IMP → SIGABRT on YapDatabase-Write
+ * at launch (doesNotRecognizeSelector). Do NOT hook _messagesUpdated.
  *
- * What actually drives the bubble:
- *  OKMChatService _messagesUpdated:inTransaction:
- *  (assert path: status == Edited || status == Removed)
- *  Removed ≈ 10. Chat list SQL: status != Removed, localRemoveStatus filters.
- *
- * v9:
- *  1) Do NOT hook ChatService delete* (own delete untouched → no crash)
- *  2) Hook _messagesUpdated: incoming + Removed → rewrite to live status,
- *     tag ❌+\ndeletel, okm_saveMessage: on the same tx, then call original
- *     so UI treats it as an update, not a wipe
- *  3) Hook PushCleanup _handleDeletedMessages as backup (skip wipe for kept)
- *  4) Credentials setCurrentUserId: only for myUserId
+ * v10:
+ *  - No ChatService hooks at all (delete* or _messagesUpdated)
+ *  - Only PushCleanup _handleDeletedMessages via C trampoline (not blocks)
+ *  - setCurrentUserId: C trampoline
+ *  - Incoming peer wipe → status away from Removed(10), tag ❌+\ndeletel,
+ *    okm_saveMessage on app write connection, skip original wipe
+ *  - Own deletes untouched
  */
 
 static NSString * const kPrefKey = @"mvibe_anti_delete_enabled";
@@ -30,8 +23,6 @@ static NSString * const kDeletedPksKey = @"mvibe_anti_delete_pks";
 static NSString * const kMyUserIdKey = @"mvibe_anti_delete_my_uid";
 static NSString * const kPrefix = @"\u274C ";
 static NSString * const kDbMarker = @"\ndeletel";
-
-/** Observed in earlier builds / asserts: OKMMessageStatusRemoved == 10 */
 static const NSInteger kStatusRemovedDefault = 10;
 
 static NSNumber *gMyUserId = nil;
@@ -41,12 +32,9 @@ static NSInteger gRemovedStatus = kStatusRemovedDefault;
 
 static id gWriteConnection = nil;
 static id gYapDatabase = nil;
-static id gChatService = nil;
 
 static IMP gOrigSetUserId = NULL;
-static IMP gOrigMessagesUpdated = NULL;
 static IMP gOrigHandleDeleted = NULL;
-static SEL gSelMessagesUpdated;
 static SEL gSelHandleDeleted;
 
 #pragma mark - Prefs
@@ -158,15 +146,6 @@ static BOOL MVMessageIsIncoming(id msg) {
     if (gMyUserId && sender) {
         return sender.unsignedLongLongValue != gMyUserId.unsignedLongLongValue;
     }
-    @try {
-        id outg = [msg valueForKey:@"outgoing"];
-        if ([outg respondsToSelector:@selector(boolValue)]) return ![outg boolValue];
-    } @catch (__unused NSException *ex) {}
-    @try {
-        id inc = [msg valueForKey:@"isIncoming"];
-        if ([inc respondsToSelector:@selector(boolValue)]) return [inc boolValue];
-    } @catch (__unused NSException *ex) {}
-    // Without myUserId, do NOT keep — safer than blocking own deletes.
     return NO;
 }
 
@@ -181,23 +160,14 @@ static NSInteger MVStatusOfMessage(id msg) {
 static void MVSetStatus(id msg, NSInteger status) {
     if (!msg || status == -999) return;
     @try {
-        SEL setSel = NSSelectorFromString(@"setStatus:");
-        if ([msg respondsToSelector:setSel]) {
-            ((void (*)(id, SEL, NSInteger))objc_msgSend)(msg, setSel, status);
-            return;
-        }
         [msg setValue:@(status) forKey:@"status"];
     } @catch (__unused NSException *ex) {}
 }
 
 static void MVClearLocalRemove(id msg) {
     @try {
-        SEL setSel = NSSelectorFromString(@"setLocalRemoveStatus:");
-        if ([msg respondsToSelector:setSel]) {
-            ((void (*)(id, SEL, unsigned long long))objc_msgSend)(msg, setSel, 0);
-            return;
-        }
-        if ([msg respondsToSelector:NSSelectorFromString(@"localRemoveStatus")]) {
+        if (class_getProperty(object_getClass(msg), "localRemoveStatus") ||
+            [msg respondsToSelector:NSSelectorFromString(@"setLocalRemoveStatus:")]) {
             [msg setValue:@0 forKey:@"localRemoveStatus"];
         }
     } @catch (__unused NSException *ex) {}
@@ -205,9 +175,7 @@ static void MVClearLocalRemove(id msg) {
 
 static BOOL MVIsRemovedStatus(NSInteger st) {
     if (st == -999) return NO;
-    if (st == gRemovedStatus) return YES;
-    if (st == kStatusRemovedDefault) return YES;
-    return NO;
+    return st == gRemovedStatus || st == kStatusRemovedDefault;
 }
 
 static NSString *MVPlainTextOfMessage(id msg) {
@@ -263,50 +231,19 @@ static void MVTagMessageText(id msg) {
     }
 }
 
-static void MVNoteLiveIfNeeded(id msg) {
-    if (!MVIsOKMMessage(msg)) return;
-    NSString *text = MVPlainTextOfMessage(msg) ?: @"";
-    if ([text containsString:kDbMarker] || [text hasPrefix:kPrefix]) return;
+static void MVConvertIncomingDelete(id msg) {
     NSInteger st = MVStatusOfMessage(msg);
-    if (st == -999 || MVIsRemovedStatus(st)) return;
-    gPreferredLiveStatus = st;
-}
-
-/** Rewrite incoming delete into visible tagged message. force=YES on push-delete path. */
-static BOOL MVConvertIncomingDelete(id msg, BOOL force) {
-    if (!MVIsOKMMessage(msg) || !MVMessageIsIncoming(msg)) return NO;
-    NSInteger st = MVStatusOfMessage(msg);
-    NSString *pk = MVPkOfMessage(msg);
-    BOOL already = pk.length && [gDeletedPks containsObject:pk];
-    BOOL removed = MVIsRemovedStatus(st);
-    if (!force && !removed && !already) return NO;
-    if (removed) gRemovedStatus = st;
-
+    if (MVIsRemovedStatus(st)) gRemovedStatus = st;
     NSInteger live = gPreferredLiveStatus;
     if (MVIsRemovedStatus(live)) live = 0;
-
-    MVLog(@"convert pk=%@ status %ld→%ld force=%d sender=%@ my=%@",
-          pk, (long)st, (long)live, force, MVSenderIdOfMessage(msg), gMyUserId);
+    MVLog(@"convert pk=%@ status %ld→%ld sender=%@ my=%@",
+          MVPkOfMessage(msg), (long)st, (long)live, MVSenderIdOfMessage(msg), gMyUserId);
     MVSetStatus(msg, live);
     MVClearLocalRemove(msg);
     MVTagMessageText(msg);
-    return YES;
 }
 
-static void MVSaveInTransaction(id tx, id msg) {
-    if (!tx || !msg) return;
-    @try {
-        SEL save = NSSelectorFromString(@"okm_saveMessage:");
-        if ([tx respondsToSelector:save]) {
-            ((void (*)(id, SEL, id))objc_msgSend)(tx, save, msg);
-            MVLog(@"save tx pk=%@ status=%ld", MVPkOfMessage(msg), (long)MVStatusOfMessage(msg));
-        }
-    } @catch (NSException *ex) {
-        MVLog(@"save tx fail %@", ex.name);
-    }
-}
-
-#pragma mark - Yap helpers (push path only)
+#pragma mark - Yap
 
 static BOOL MVLooksLikeWriteConnection(id obj) {
     if (!obj) return NO;
@@ -387,7 +324,19 @@ static void MVSaveMessageStandalone(id seed, id msg) {
         MVLog(@"save skip: no conn");
         return;
     }
-    void (^write)(id) = ^(id tx) { MVSaveInTransaction(tx, msg); };
+    void (^write)(id) = ^(id tx) {
+        @try {
+            SEL save = NSSelectorFromString(@"okm_saveMessage:");
+            if (![tx respondsToSelector:save]) {
+                MVLog(@"save skip: no okm_saveMessage on %@", NSStringFromClass([tx class]));
+                return;
+            }
+            ((void (*)(id, SEL, id))objc_msgSend)(tx, save, msg);
+            MVLog(@"save ok pk=%@ status=%ld", MVPkOfMessage(msg), (long)MVStatusOfMessage(msg));
+        } @catch (NSException *ex) {
+            MVLog(@"save fail %@", ex.name);
+        }
+    };
     @try {
         SEL syncRW = NSSelectorFromString(@"readWriteWithBlock:");
         SEL asyncRW = NSSelectorFromString(@"asyncReadWriteWithBlock:completionBlock:");
@@ -401,43 +350,66 @@ static void MVSaveMessageStandalone(id seed, id msg) {
     }
 }
 
-/** Tell UI to refresh without going through our hook (use saved IMP). */
-static void MVNotifyUI(NSArray *msgs) {
-    if (!gChatService || !gOrigMessagesUpdated || !msgs.count) return;
-    @try {
-        ((void (*)(id, SEL, id, id))gOrigMessagesUpdated)(gChatService, gSelMessagesUpdated, msgs, nil);
-        MVLog(@"ui notify n=%lu", (unsigned long)msgs.count);
-    } @catch (NSException *ex) {
-        MVLog(@"ui notify fail %@", ex.name);
-    }
-}
-
-#pragma mark - Hooks
+#pragma mark - C trampolines (no block IMPs)
 
 static void mvibe_setCurrentUserId(id self, SEL _cmd, NSNumber *uid) {
     MVRememberMyUserId(uid);
     if (gOrigSetUserId) ((void (*)(id, SEL, id))gOrigSetUserId)(self, _cmd, uid);
 }
 
-static BOOL MVHookBlock(Class cls, SEL sel, id block, IMP *outOrig) {
-    if (!cls || !sel || !block || !outOrig) return NO;
-    Method m = class_getInstanceMethod(cls, sel);
-    if (!m) return NO;
-    *outOrig = method_getImplementation(m);
-    if (!*outOrig) return NO;
-    IMP neu = imp_implementationWithBlock(block);
-    method_setImplementation(m, neu);
-    return YES;
+static void mvibe_handleDeletedMessages(id self, SEL _cmd, id messages, id chatId) {
+    MVEnsureStore();
+    if (!MaxVibeAntiDeleteEnabled() || !gOrigHandleDeleted) {
+        if (gOrigHandleDeleted)
+            ((void (*)(id, SEL, id, id))gOrigHandleDeleted)(self, _cmd, messages, chatId);
+        return;
+    }
+
+    MVFindConnectionFromSeed(self);
+
+    NSArray *list = nil;
+    if ([messages isKindOfClass:[NSArray class]]) list = messages;
+    else if ([messages respondsToSelector:@selector(allObjects)]) list = [messages allObjects];
+    if (!list) {
+        ((void (*)(id, SEL, id, id))gOrigHandleDeleted)(self, _cmd, messages, chatId);
+        return;
+    }
+
+    NSMutableArray *allow = [NSMutableArray array];
+    NSUInteger kept = 0;
+    for (id item in list) {
+        if (!MVIsOKMMessage(item)) {
+            [allow addObject:item];
+            continue;
+        }
+        MVLog(@"push pk=%@ sender=%@ inc=%d status=%ld",
+              MVPkOfMessage(item), MVSenderIdOfMessage(item),
+              MVMessageIsIncoming(item), (long)MVStatusOfMessage(item));
+        if (MVMessageIsIncoming(item)) {
+            MVConvertIncomingDelete(item);
+            MVSaveMessageStandalone(self, item);
+            kept++;
+        } else {
+            [allow addObject:item];
+        }
+    }
+    MVLog(@"handleDeletedMessages chat=%@ keep=%lu allow=%lu",
+          chatId, (unsigned long)kept, (unsigned long)allow.count);
+    if (allow.count == 0) return;
+    if (allow.count == list.count) {
+        ((void (*)(id, SEL, id, id))gOrigHandleDeleted)(self, _cmd, messages, chatId);
+    } else {
+        ((void (*)(id, SEL, id, id))gOrigHandleDeleted)(self, _cmd, allow, chatId);
+    }
 }
 
 void MaxVibeInstallAntiDelete(void) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         MVEnsureStore();
-        gSelMessagesUpdated = NSSelectorFromString(@"_messagesUpdated:inTransaction:");
         gSelHandleDeleted = NSSelectorFromString(@"_handleDeletedMessages:inChatWithId:");
-        MVLog(@"install begin v9 (messagesUpdated rewrite, no ChatService delete hooks) enabled=%d removed=%ld",
-              MaxVibeAntiDeleteEnabled(), (long)gRemovedStatus);
+        MVLog(@"install begin v10 (launch-safe, push-only C trampoline) enabled=%d",
+              MaxVibeAntiDeleteEnabled());
 
         Class creds = NSClassFromString(@"OKMMessengerCredentials");
         Method mCred = class_getInstanceMethod(creds, NSSelectorFromString(@"setCurrentUserId:"));
@@ -449,89 +421,16 @@ void MaxVibeInstallAntiDelete(void) {
             MVLog(@"setCurrentUserId: FAIL");
         }
 
-        // Main UI path: turn Removed → tagged update before ChatService applies it.
-        Class chat = NSClassFromString(@"OKMChatService");
-        BOOL okUpd = MVHookBlock(chat, gSelMessagesUpdated, ^void(id self, id messages, id tx) {
-            MVEnsureStore();
-            gChatService = self;
-            MVRememberConnection(MVKVC(self, @"dbWriteConnection") ?: MVKVC(self, @"writeConnection"));
-            if (!MaxVibeAntiDeleteEnabled() || !gOrigMessagesUpdated) {
-                if (gOrigMessagesUpdated)
-                    ((void (*)(id, SEL, id, id))gOrigMessagesUpdated)(self, gSelMessagesUpdated, messages, tx);
-                return;
-            }
-            if (![messages isKindOfClass:[NSArray class]]) {
-                ((void (*)(id, SEL, id, id))gOrigMessagesUpdated)(self, gSelMessagesUpdated, messages, tx);
-                return;
-            }
-            NSUInteger converted = 0;
-            for (id msg in (NSArray *)messages) {
-                if (!MVIsOKMMessage(msg)) continue;
-                MVNoteLiveIfNeeded(msg);
-                if (!MVConvertIncomingDelete(msg, NO)) continue;
-                MVSaveInTransaction(tx, msg);
-                converted++;
-            }
-            if (converted) {
-                MVLog(@"messagesUpdated converted=%lu total=%lu",
-                      (unsigned long)converted, (unsigned long)[(NSArray *)messages count]);
-            }
-            ((void (*)(id, SEL, id, id))gOrigMessagesUpdated)(self, gSelMessagesUpdated, messages, tx);
-        }, &gOrigMessagesUpdated);
-        MVLog(@"_messagesUpdated: %s", okUpd ? "OK" : "FAIL");
-
-        // Backup: push cleanup still tries to wipe Yap for peer deletes.
         Class push = NSClassFromString(@"OKMPushCleanupHelper");
-        BOOL okPush = MVHookBlock(push, gSelHandleDeleted, ^void(id self, id messages, id chatId) {
-            MVEnsureStore();
-            MVFindConnectionFromSeed(self);
-            if (!MaxVibeAntiDeleteEnabled() || !gOrigHandleDeleted) {
-                if (gOrigHandleDeleted)
-                    ((void (*)(id, SEL, id, id))gOrigHandleDeleted)(self, gSelHandleDeleted, messages, chatId);
-                return;
-            }
-            NSArray *list = nil;
-            if ([messages isKindOfClass:[NSArray class]]) list = messages;
-            else if ([messages respondsToSelector:@selector(allObjects)]) list = [messages allObjects];
-            if (!list) {
-                ((void (*)(id, SEL, id, id))gOrigHandleDeleted)(self, gSelHandleDeleted, messages, chatId);
-                return;
-            }
-            NSMutableArray *allow = [NSMutableArray array];
-            NSMutableArray *keptMsgs = [NSMutableArray array];
-            NSUInteger kept = 0;
-            for (id item in list) {
-                if (!MVIsOKMMessage(item)) {
-                    [allow addObject:item];
-                    continue;
-                }
-                MVLog(@"push pk=%@ sender=%@ inc=%d status=%ld",
-                      MVPkOfMessage(item), MVSenderIdOfMessage(item),
-                      MVMessageIsIncoming(item), (long)MVStatusOfMessage(item));
-                if (MVMessageIsIncoming(item) && MVConvertIncomingDelete(item, YES)) {
-                    MVSaveMessageStandalone(self, item);
-                    [keptMsgs addObject:item];
-                    kept++;
-                } else {
-                    [allow addObject:item];
-                }
-            }
-            MVLog(@"handleDeletedMessages chat=%@ keep=%lu allow=%lu",
-                  chatId, (unsigned long)kept, (unsigned long)allow.count);
-            if (keptMsgs.count) {
-                dispatch_async(dispatch_get_main_queue(), ^{
-                    MVNotifyUI(keptMsgs);
-                });
-            }
-            if (allow.count == 0) return;
-            if (allow.count == list.count) {
-                ((void (*)(id, SEL, id, id))gOrigHandleDeleted)(self, gSelHandleDeleted, messages, chatId);
-            } else {
-                ((void (*)(id, SEL, id, id))gOrigHandleDeleted)(self, gSelHandleDeleted, allow, chatId);
-            }
-        }, &gOrigHandleDeleted);
-        MVLog(@"_handleDeletedMessages: %s", okPush ? "OK" : "FAIL");
+        Method mPush = class_getInstanceMethod(push, gSelHandleDeleted);
+        if (mPush) {
+            gOrigHandleDeleted = method_getImplementation(mPush);
+            method_setImplementation(mPush, (IMP)mvibe_handleDeletedMessages);
+            MVLog(@"_handleDeletedMessages: OK");
+        } else {
+            MVLog(@"_handleDeletedMessages: FAIL");
+        }
 
-        MVLog(@"install done my=%@", gMyUserId);
+        MVLog(@"install done my=%@ (no _messagesUpdated / no ChatService delete hooks)", gMyUserId);
     });
 }
