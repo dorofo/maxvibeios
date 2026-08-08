@@ -2,6 +2,7 @@
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
+#import <stdarg.h>
 
 /*
  * Anti-delete for MAX iOS (parity with Android MvibeAntiDelete*):
@@ -465,15 +466,16 @@ static NSAttributedString *MVApplyMarkerToAttributed(NSAttributedString *attr) {
     MVEnsureStore();
     if (MaxVibeAntiDeleteEnabled() && MVLooksLikeMessagesCollection(collection)) {
         id msg = nil;
-        @try { msg = [self objectForKey:key inCollection:collection]; } @catch (__unused NSException *e) {}
+        @try {
+            msg = ((id (*)(id, SEL, id, id))objc_msgSend)(self, @selector(objectForKey:inCollection:), key, collection);
+        } @catch (__unused NSException *e) {}
         if (!msg && [key isKindOfClass:[NSString class]]) {
-            // synthesize from cache
             NSDictionary *c = gMsgCache[key];
             if (c && gMyUserId && c[@"senderId"] &&
                 [c[@"senderId"] unsignedLongLongValue] != gMyUserId.unsignedLongLongValue) {
                 MVMarkDeletedPk(key);
                 MVLog(@"block remove pk=%@ (cache incoming)", key);
-                return; // keep row; UI may still hide until status rewrite path runs
+                return;
             }
         }
         if (MVIsOKMMessage(msg) && MVIsIncomingMessage(msg)) {
@@ -482,15 +484,11 @@ static NSAttributedString *MVApplyMarkerToAttributed(NSAttributedString *attr) {
             @try {
                 MVTagMessageAsDeleted(msg);
                 MVRestorePriorStatus(msg);
-                // Prefer okm_saveMessage if available
                 SEL save = NSSelectorFromString(@"okm_saveMessage:");
                 if ([self respondsToSelector:save]) {
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
-                    [self performSelector:save withObject:msg];
-#pragma clang diagnostic pop
+                    ((void (*)(id, SEL, id))objc_msgSend)(self, save, msg);
                 } else {
-                    [self setObject:msg forKey:key inCollection:collection];
+                    ((void (*)(id, SEL, id, id, id))objc_msgSend)(self, @selector(setObject:forKey:inCollection:), msg, key, collection);
                 }
             } @catch (__unused NSException *ex) {
             } @finally {
@@ -513,7 +511,9 @@ static NSAttributedString *MVApplyMarkerToAttributed(NSAttributedString *attr) {
     NSMutableArray *allow = [NSMutableArray array];
     for (id key in keys) {
         id msg = nil;
-        @try { msg = [self objectForKey:key inCollection:collection]; } @catch (__unused NSException *e) {}
+        @try {
+            msg = ((id (*)(id, SEL, id, id))objc_msgSend)(self, @selector(objectForKey:inCollection:), key, collection);
+        } @catch (__unused NSException *e) {}
         BOOL keep = NO;
         if (MVIsOKMMessage(msg) && MVIsIncomingMessage(msg)) {
             keep = YES;
@@ -523,12 +523,9 @@ static NSAttributedString *MVApplyMarkerToAttributed(NSAttributedString *attr) {
                 MVRestorePriorStatus(msg);
                 SEL save = NSSelectorFromString(@"okm_saveMessage:");
                 if ([self respondsToSelector:save]) {
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
-                    [self performSelector:save withObject:msg];
-#pragma clang diagnostic pop
+                    ((void (*)(id, SEL, id))objc_msgSend)(self, save, msg);
                 } else {
-                    [self setObject:msg forKey:key inCollection:collection];
+                    ((void (*)(id, SEL, id, id, id))objc_msgSend)(self, @selector(setObject:forKey:inCollection:), msg, key, collection);
                 }
             } @catch (__unused NSException *ex) {
             } @finally {
