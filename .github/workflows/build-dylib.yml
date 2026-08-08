@@ -26,19 +26,26 @@ jobs:
             -framework UIKit \
             -framework CoreGraphics \
             -framework QuartzCore \
+            -framework Security \
             -install_name "@executable_path/Frameworks/MaxVibeBanner.dylib" \
             -o MaxVibeBanner.dylib \
+            banner/fishhook.c \
             banner/MaxVibePersist.m \
             banner/MaxVibeBanner.m
-          # fishhook intentionally omitted — caused crashes on launch
           lipo -info MaxVibeBanner.dylib
           ls -la MaxVibeBanner.dylib
+
+          # Optional: ldid for local testing artifacts
+          if command -v ldid >/dev/null 2>&1; then
+            ldid -Sbanner/entitlements.plist MaxVibeBanner.dylib || true
+          fi
 
       - name: Package artifact
         run: |
           mkdir -p dist
           cp MaxVibeBanner.dylib dist/
           cp banner/banner_character.png dist/
+          cp banner/entitlements.plist dist/
           cp scripts/inject_banner.py dist/
 
       - name: Upload artifact

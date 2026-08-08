@@ -134,18 +134,10 @@ static void MVExchangeInstance(Class cls, SEL origSel, SEL swizSel) {
 - (void)installSettingsHooks {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
-        // Add helper methods onto target VCs via class_addMethod from our class, then swizzle.
+        // Main settings list only (О приложении / Помощь / бизнес…)
         Class settingsVC = NSClassFromString(@"_TtC10SettingsUI22SettingsViewController");
-        Class aboutVC = NSClassFromString(@"_TtC10SettingsUI15AboutController");
-        Class genericVC = NSClassFromString(@"_TtC10SettingsUI28GenericSettingsViewController");
-        // GenericSettingsViewController mangled length may differ — try common names
-        if (!genericVC) genericVC = NSClassFromString(@"_TtC10SettingsUI27GenericSettingsViewController");
-
         [self swizzleViewDidAppearOn:settingsVC];
-        [self swizzleViewDidAppearOn:aboutVC];
-        [self swizzleViewDidAppearOn:genericVC];
 
-        // Also observe navigation transitions as fallback
         [[NSNotificationCenter defaultCenter] addObserver:self
                                                  selector:@selector(onAnyTransition)
                                                      name:UIApplicationDidBecomeActiveNotification
@@ -161,7 +153,6 @@ static void MVExchangeInstance(Class cls, SEL origSel, SEL swizSel) {
     Method mDonor = class_getInstanceMethod([self class], swiz);
     if (!mOrig || !mDonor) return;
 
-    // Add donor IMP to target class under swiz name if needed
     IMP donorImp = method_getImplementation(mDonor);
     const char *types = method_getTypeEncoding(mDonor);
     class_addMethod(cls, swiz, donorImp, types);
@@ -171,20 +162,20 @@ static void MVExchangeInstance(Class cls, SEL origSel, SEL swizSel) {
 }
 
 - (void)mvibe_viewDidAppear:(BOOL)animated {
-    // After exchange, this IMP runs for Settings VC; calling mvibe_viewDidAppear hits original.
     [self mvibe_viewDidAppear:animated];
     UIViewController *vc = (UIViewController *)self;
     if (![vc isKindOfClass:[UIViewController class]]) return;
-    dispatch_async(dispatch_get_main_queue(), ^{
+    // Delay so list finishes layout; attach at END as footer
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
         [[MaxVibeModController shared] attachSettingsRowToViewController:vc];
     });
 }
 
 - (void)onAnyTransition {
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)),
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
-        UIViewController *root = [self keyWindow].rootViewController;
-        UIViewController *top = root;
+        UIViewController *top = [self keyWindow].rootViewController;
         while (top.presentedViewController) top = top.presentedViewController;
         if ([top isKindOfClass:[UINavigationController class]]) {
             top = ((UINavigationController *)top).visibleViewController;
@@ -195,67 +186,61 @@ static void MVExchangeInstance(Class cls, SEL origSel, SEL swizSel) {
                 top = ((UINavigationController *)top).visibleViewController;
             }
         }
-        NSString *name = NSStringFromClass([top class]);
-        if ([name containsString:@"SettingsViewController"] ||
-            [name containsString:@"AboutController"] ||
-            [name containsString:@"GenericSettings"]) {
+        if ([NSStringFromClass([top class]) containsString:@"SettingsViewController"]) {
             [self attachSettingsRowToViewController:top];
         }
     });
 }
 
-- (UIScrollView *)findScrollView:(UIView *)root {
-    if ([root isKindOfClass:[UIScrollView class]]) return (UIScrollView *)root;
-    for (UIView *v in root.subviews) {
-        UIScrollView *s = [self findScrollView:v];
-        if (s) return s;
+- (UIScrollView *)findBestScrollView:(UIView *)root {
+    NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:root];
+    UIScrollView *best = nil;
+    CGFloat bestArea = 0;
+    while (stack.count) {
+        UIView *v = stack.lastObject;
+        [stack removeLastObject];
+        if ([v isKindOfClass:[UITableView class]] || [v isKindOfClass:[UICollectionView class]]) {
+            CGFloat area = v.bounds.size.width * MAX(v.bounds.size.height, 1);
+            if (area >= bestArea) { bestArea = area; best = (UIScrollView *)v; }
+        }
+        for (UIView *c in v.subviews) [stack addObject:c];
     }
-    return nil;
+    return best;
 }
 
-- (UIView *)buildSettingsRow {
-    UIControl *row = [[UIControl alloc] initWithFrame:CGRectMake(0, 0, 320, 56)];
-    row.backgroundColor = [[UIColor labelColor] colorWithAlphaComponent:0.06];
+/** Native-looking settings row at list END (like О приложении / Помощь). */
+- (UIView *)buildNativeSettingsFooterWithWidth:(CGFloat)width {
+    CGFloat side = 20.0;
+    CGFloat innerW = MAX(width - side * 2, 280);
+    CGFloat rowH = 52.0;
+    CGFloat topPad = 18.0;
+    CGFloat bottomPad = 36.0;
+    UIView *wrap = [[UIView alloc] initWithFrame:CGRectMake(0, 0, width, topPad + rowH + bottomPad)];
+    wrap.backgroundColor = UIColor.clearColor;
+
+    UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
+    cell.frame = CGRectMake(side, topPad, innerW, rowH);
+    cell.textLabel.text = @"Настройки MaxVibe";
+    cell.textLabel.font = [UIFont systemFontOfSize:17];
+    cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+    cell.selectionStyle = UITableViewCellSelectionStyleDefault;
     if (@available(iOS 13.0, *)) {
-        row.backgroundColor = [UIColor secondarySystemGroupedBackgroundColor];
+        cell.backgroundColor = [UIColor secondarySystemGroupedBackgroundColor];
+        cell.textLabel.textColor = [UIColor labelColor];
+    } else {
+        cell.backgroundColor = [UIColor whiteColor];
     }
-    row.layer.cornerRadius = 14;
-    row.clipsToBounds = YES;
-    [row addTarget:self action:@selector(showSettings) forControlEvents:UIControlEventTouchUpInside];
+    cell.layer.cornerRadius = 12;
+    cell.clipsToBounds = YES;
 
-    UILabel *title = [[UILabel alloc] init];
-    title.text = @"Настройки MaxVibe";
-    title.font = [UIFont systemFontOfSize:17 weight:UIFontWeightRegular];
-    title.textColor = [UIColor labelColor];
-    title.translatesAutoresizingMaskIntoConstraints = NO;
+    UIButton *hit = [UIButton buttonWithType:UIButtonTypeCustom];
+    hit.frame = cell.bounds;
+    hit.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    [hit addTarget:self action:@selector(showSettings) forControlEvents:UIControlEventTouchUpInside];
+    [cell.contentView addSubview:hit];
 
-    UILabel *chev = [[UILabel alloc] init];
-    chev.text = @"›";
-    chev.font = [UIFont systemFontOfSize:24 weight:UIFontWeightLight];
-    chev.textColor = [UIColor tertiaryLabelColor];
-    chev.translatesAutoresizingMaskIntoConstraints = NO;
-
-    UIView *dot = [[UIView alloc] init];
-    dot.backgroundColor = [self hex:0xE85A7A alpha:1];
-    dot.layer.cornerRadius = 4;
-    dot.translatesAutoresizingMaskIntoConstraints = NO;
-
-    [row addSubview:dot];
-    [row addSubview:title];
-    [row addSubview:chev];
-    [NSLayoutConstraint activateConstraints:@[
-        [dot.leadingAnchor constraintEqualToAnchor:row.leadingAnchor constant:16],
-        [dot.centerYAnchor constraintEqualToAnchor:row.centerYAnchor],
-        [dot.widthAnchor constraintEqualToConstant:8],
-        [dot.heightAnchor constraintEqualToConstant:8],
-        [title.leadingAnchor constraintEqualToAnchor:dot.trailingAnchor constant:12],
-        [title.centerYAnchor constraintEqualToAnchor:row.centerYAnchor],
-        [chev.trailingAnchor constraintEqualToAnchor:row.trailingAnchor constant:-14],
-        [chev.centerYAnchor constraintEqualToAnchor:row.centerYAnchor],
-        [title.trailingAnchor constraintLessThanOrEqualToAnchor:chev.leadingAnchor constant:-8],
-        [row.heightAnchor constraintEqualToConstant:56],
-    ]];
-    return row;
+    [wrap addSubview:cell];
+    return wrap;
 }
 
 - (void)attachSettingsRowToViewController:(UIViewController *)vc {
@@ -263,58 +248,69 @@ static void MVExchangeInstance(Class cls, SEL origSel, SEL swizSel) {
     if (objc_getAssociatedObject(vc, &kMvibeSettingsRowKey)) return;
 
     NSString *cls = NSStringFromClass([vc class]);
-    BOOL isSettings = [cls containsString:@"SettingsViewController"] ||
-                      [cls containsString:@"AboutController"] ||
-                      [cls containsString:@"GenericSettings"];
-    if (!isSettings) return;
+    if (![cls containsString:@"SettingsViewController"]) return;
 
-    UIView *row = [self buildSettingsRow];
-    row.translatesAutoresizingMaskIntoConstraints = NO;
+    UIScrollView *scroll = [self findBestScrollView:vc.view];
+    CGFloat width = MAX(vc.view.bounds.size.width, scroll.bounds.size.width);
+    if (width < 100) width = [UIScreen mainScreen].bounds.size.width;
 
-    UITableView *table = nil;
-    UIScrollView *scroll = [self findScrollView:vc.view];
-    if ([scroll isKindOfClass:[UITableView class]]) table = (UITableView *)scroll;
+    UIView *footer = [self buildNativeSettingsFooterWithWidth:width];
 
-    if (table) {
-        CGFloat w = MAX(table.bounds.size.width, vc.view.bounds.size.width);
-        CGFloat extra = 72;
-        UIView *old = table.tableHeaderView;
-        CGFloat oldH = old ? old.bounds.size.height : 0;
-        UIView *wrap = [[UIView alloc] initWithFrame:CGRectMake(0, 0, w, oldH + extra)];
-        if (old) {
-            old.frame = CGRectMake(0, 0, w, oldH);
-            [wrap addSubview:old];
+    if ([scroll isKindOfClass:[UITableView class]]) {
+        UITableView *table = (UITableView *)scroll;
+        UIView *old = table.tableFooterView;
+        if (old && old.bounds.size.height > 8) {
+            CGFloat h = old.bounds.size.height + footer.bounds.size.height;
+            UIView *combo = [[UIView alloc] initWithFrame:CGRectMake(0, 0, width, h)];
+            old.frame = CGRectMake(0, 0, width, old.bounds.size.height);
+            footer.frame = CGRectMake(0, old.bounds.size.height, width, footer.bounds.size.height);
+            [combo addSubview:old];
+            [combo addSubview:footer];
+            table.tableFooterView = combo;
+            objc_setAssociatedObject(vc, &kMvibeSettingsRowKey, combo, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        } else {
+            table.tableFooterView = footer;
+            objc_setAssociatedObject(vc, &kMvibeSettingsRowKey, footer, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         }
-        [wrap addSubview:row];
-        [NSLayoutConstraint activateConstraints:@[
-            [row.leadingAnchor constraintEqualToAnchor:wrap.leadingAnchor constant:16],
-            [row.trailingAnchor constraintEqualToAnchor:wrap.trailingAnchor constant:-16],
-            [row.bottomAnchor constraintEqualToAnchor:wrap.bottomAnchor constant:-8],
-            [row.heightAnchor constraintEqualToConstant:56],
-        ]];
-        // layout wrap width for tableHeaderView
-        wrap.frame = CGRectMake(0, 0, w, oldH + extra);
-        [wrap setNeedsLayout];
-        [wrap layoutIfNeeded];
-        CGFloat h = oldH + extra;
-        wrap.frame = CGRectMake(0, 0, w, h);
-        table.tableHeaderView = wrap;
-    } else {
-        // Fallback: pin under safe area (looks like first settings item)
-        [vc.view addSubview:row];
-        [NSLayoutConstraint activateConstraints:@[
-            [row.leadingAnchor constraintEqualToAnchor:vc.view.safeAreaLayoutGuide.leadingAnchor constant:16],
-            [row.trailingAnchor constraintEqualToAnchor:vc.view.safeAreaLayoutGuide.trailingAnchor constant:-16],
-            [row.topAnchor constraintEqualToAnchor:vc.view.safeAreaLayoutGuide.topAnchor constant:8],
-            [row.heightAnchor constraintEqualToConstant:56],
-        ]];
-        UIEdgeInsets insets = vc.additionalSafeAreaInsets;
-        insets.top = MAX(insets.top, 72);
-        vc.additionalSafeAreaInsets = insets;
+        return;
     }
 
-    objc_setAssociatedObject(vc, &kMvibeSettingsRowKey, row, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    if ([scroll isKindOfClass:[UICollectionView class]]) {
+        UICollectionView *cv = (UICollectionView *)scroll;
+        [cv layoutIfNeeded];
+        CGFloat y = cv.contentSize.height + 8;
+        footer.frame = CGRectMake(0, y, width, footer.bounds.size.height);
+        footer.tag = 0x4D564942; // MVIB
+        [cv addSubview:footer];
+        UIEdgeInsets inset = cv.contentInset;
+        inset.bottom = MAX(inset.bottom, footer.bounds.size.height + 24);
+        cv.contentInset = inset;
+        // Reposition a few times after data reloads
+        __weak UICollectionView *weakCV = cv;
+        __weak UIView *weakFooter = footer;
+        for (NSNumber *delay in @[@0.6, @1.2, @2.0]) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay.doubleValue * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                UICollectionView *c = weakCV; UIView *f = weakFooter;
+                if (!c || !f || f.superview != c) return;
+                [c layoutIfNeeded];
+                CGFloat maxY = 0;
+                for (UIView *v in c.subviews) {
+                    if (v == f || v.tag == 0x4D564942) continue;
+                    if ([NSStringFromClass([v class]) containsString:@"Reordered"] ) continue;
+                    // skip scroll indicators
+                    if (v.bounds.size.height < 3 && v.bounds.size.width < 3) continue;
+                    maxY = MAX(maxY, CGRectGetMaxY(v.frame));
+                }
+                if (maxY < 80) maxY = c.contentSize.height;
+                f.frame = CGRectMake(0, maxY + 10, c.bounds.size.width, f.bounds.size.height);
+            });
+        }
+        objc_setAssociatedObject(vc, &kMvibeSettingsRowKey, footer, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        return;
+    }
 }
+
 
 #pragma mark - Settings sheet
 
