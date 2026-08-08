@@ -5,22 +5,20 @@
 #import <stdarg.h>
 
 /*
- * Anti-delete (safe):
- * - Do NOT swizzle YapDatabase — that caused doesNotRecognizeSelector on YapDatabase-Write
- *   and crash loops on launch.
- * - Only filter OKMChatService deleteMessages* + OKMPushCleanupHelper handleDeletedMessages
- *   so incoming PKs never enter the official delete pipeline.
- * - Tag text in-memory with \ndeletel when we have an OKMMessage; UILabel shows red "deleted".
+ * Anti-delete v2 (Android-style):
+ * Incoming "delete for everyone" → keep row, UPDATE text with "❌ " prefix.
+ * Do NOT swizzle YapDatabase / UILabel (those caused SIGABRT / SIGSEGV).
+ * Own deletes pass through unchanged.
  */
 
 static NSString * const kPrefKey = @"mvibe_anti_delete_enabled";
+static NSString * const kSafeMigratedKey = @"mvibe_anti_delete_safe_v2";
 static NSString * const kDeletedPksKey = @"mvibe_anti_delete_pks";
 static NSString * const kMyUserIdKey = @"mvibe_anti_delete_my_uid";
-static NSString * const kDbMarker = @"\ndeletel";
-static NSString * const kUiMarker = @"deleted";
+static NSString * const kPrefix = @"❌ ";
 
 static NSNumber *gMyUserId = nil;
-static NSMutableDictionary *gMsgCache = nil; // pk -> @{senderId, text}
+static NSMutableDictionary *gMsgCache = nil; // pk -> @{senderId, text, serverId}
 static NSMutableSet *gDeletedPks = nil;
 
 #pragma mark - Prefs
@@ -51,9 +49,16 @@ static void MVEnsureStore(void) {
     dispatch_once(&once, ^{
         gMsgCache = [NSMutableDictionary dictionary];
         gDeletedPks = [NSMutableSet set];
-        NSArray *saved = [[NSUserDefaults standardUserDefaults] arrayForKey:kDeletedPksKey];
+        NSUserDefaults *p = [NSUserDefaults standardUserDefaults];
+        // One-shot: old Yap builds left enabled=1 and crash-looped. Force OFF once.
+        if (![p boolForKey:kSafeMigratedKey]) {
+            [p setBool:NO forKey:kPrefKey];
+            [p setBool:YES forKey:kSafeMigratedKey];
+            MVLog(@"migration v2: forced anti-delete OFF once");
+        }
+        NSArray *saved = [p arrayForKey:kDeletedPksKey];
         if ([saved isKindOfClass:[NSArray class]]) [gDeletedPks addObjectsFromArray:saved];
-        id uid = [[NSUserDefaults standardUserDefaults] objectForKey:kMyUserIdKey];
+        id uid = [p objectForKey:kMyUserIdKey];
         if ([uid isKindOfClass:[NSNumber class]]) gMyUserId = uid;
     });
 }
@@ -101,6 +106,25 @@ static NSString *MVPlainTextOfMessage(id msg) {
     return nil;
 }
 
+static void MVSetPlainText(id msg, NSString *text) {
+    if (!msg || !text) return;
+    @try {
+        id textObj = [msg valueForKey:@"text"];
+        if ([textObj isKindOfClass:[NSString class]]) {
+            [msg setValue:text forKey:@"text"];
+        } else if (textObj) {
+            [textObj setValue:text forKey:@"text"];
+            SEL setup = NSSelectorFromString(@"_setupTextAndLinks:");
+            if ([textObj respondsToSelector:setup]) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+                [textObj performSelector:setup withObject:text];
+#pragma clang diagnostic pop
+            }
+        }
+    } @catch (__unused NSException *ex) {}
+}
+
 static void MVCacheMessage(id msg) {
     if (!MVIsOKMMessage(msg)) return;
     NSString *pk = MVPkOfMessage(msg);
@@ -118,25 +142,34 @@ static void MVCacheMessage(id msg) {
 
 static BOOL MVIsIncomingMessage(id msg) {
     NSNumber *sender = MVSenderIdOfMessage(msg);
-    if (!gMyUserId || !sender) return YES;
+    if (!gMyUserId || !sender) return NO; // unknown → do not keep (own deletes must work)
     return sender.unsignedLongLongValue != gMyUserId.unsignedLongLongValue;
 }
 
-static BOOL MVPkLooksIncoming(id pkOrKey) {
-    if (!pkOrKey) return YES;
-    NSString *key = [pkOrKey isKindOfClass:[NSString class]] ? pkOrKey : [pkOrKey description];
+static NSString *MVNormalizePk(id pkOrKey) {
+    if (!pkOrKey) return nil;
+    if ([pkOrKey isKindOfClass:[NSString class]]) return pkOrKey;
+    if ([pkOrKey respondsToSelector:@selector(stringValue)]) return [pkOrKey stringValue];
+    return [pkOrKey description];
+}
+
+static NSDictionary *MVCacheEntryForPk(id pkOrKey) {
+    NSString *key = MVNormalizePk(pkOrKey);
+    if (!key.length) return nil;
     NSDictionary *c = gMsgCache[key];
-    if (!c) {
-        for (NSString *k in gMsgCache) {
-            id sid = gMsgCache[k][@"serverId"];
-            if (sid && ([[sid description] isEqualToString:key] || [sid isEqual:pkOrKey])) {
-                c = gMsgCache[k];
-                break;
-            }
+    if (c) return c;
+    for (NSString *k in gMsgCache) {
+        id sid = gMsgCache[k][@"serverId"];
+        if (sid && ([[sid description] isEqualToString:key] || [sid isEqual:pkOrKey])) {
+            return gMsgCache[k];
         }
     }
-    // Unknown pk: do NOT keep by default — otherwise own deletes break.
-    // Peer deletes usually still deliver OKMMessage objects to handleDeletedMessages.
+    return nil;
+}
+
+/** YES only when cache proves this pk is incoming. Unknown → NO. */
+static BOOL MVPkLooksIncoming(id pkOrKey) {
+    NSDictionary *c = MVCacheEntryForPk(pkOrKey);
     if (!c) return NO;
     NSNumber *sender = c[@"senderId"];
     if (!gMyUserId || !sender) return NO;
@@ -144,38 +177,38 @@ static BOOL MVPkLooksIncoming(id pkOrKey) {
 }
 
 static NSString *MVStripMarkers(NSString *text) {
-    if (!text) return text;
+    if (![text isKindOfClass:[NSString class]]) return text ?: @"";
     NSString *s = text;
-    for (NSString *m in @[kDbMarker, @"\ndeleted", @"\nудалено"]) {
+    if ([s hasPrefix:kPrefix]) s = [s substringFromIndex:kPrefix.length];
+    for (NSString *m in @[@"\ndeletel", @"\ndeleted", @"\nудалено"]) {
         s = [s stringByReplacingOccurrencesOfString:m withString:@""];
     }
     while ([s hasSuffix:@"\n"]) s = [s substringToIndex:s.length - 1];
     return s;
 }
 
-static void MVTagMessageAsDeleted(id msg) {
+/** Mark as anti-deleted: prefix ❌, remember pk. Does not touch Yap APIs. */
+static void MVMarkMessageDeleted(id msg) {
+    if (!MVIsOKMMessage(msg)) return;
     NSString *pk = MVPkOfMessage(msg);
-    NSString *text = MVStripMarkers(MVPlainTextOfMessage(msg) ?: @"");
-    NSString *tagged = [text stringByAppendingString:kDbMarker];
-    @try {
-        id textObj = [msg valueForKey:@"text"];
-        if ([textObj isKindOfClass:[NSString class]]) {
-            [msg setValue:tagged forKey:@"text"];
-        } else if (textObj) {
-            [textObj setValue:tagged forKey:@"text"];
-            SEL setup = NSSelectorFromString(@"_setupTextAndLinks:");
-            if ([textObj respondsToSelector:setup]) {
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
-                [textObj performSelector:setup withObject:tagged];
-#pragma clang diagnostic pop
-            }
-        }
-    } @catch (__unused NSException *ex) {}
+    NSString *base = MVStripMarkers(MVPlainTextOfMessage(msg) ?: @"");
+    NSString *tagged = [kPrefix stringByAppendingString:base];
+    MVSetPlainText(msg, tagged);
     if (pk.length) {
         [gDeletedPks addObject:pk];
         MVPersistDeletedPks();
     }
+    MVCacheMessage(msg);
+    MVLog(@"marked deleted pk=%@ text=%@", pk, tagged.length > 60 ? [tagged substringToIndex:60] : tagged);
+}
+
+static void MVReapplyMarkerIfNeeded(id msg) {
+    if (!MVIsOKMMessage(msg)) return;
+    NSString *pk = MVPkOfMessage(msg);
+    if (!pk.length || ![gDeletedPks containsObject:pk]) return;
+    NSString *text = MVPlainTextOfMessage(msg) ?: @"";
+    if ([text hasPrefix:kPrefix]) return;
+    MVSetPlainText(msg, [kPrefix stringByAppendingString:MVStripMarkers(text)]);
     MVCacheMessage(msg);
 }
 
@@ -189,25 +222,6 @@ static void MVTryLearnCredentialsFrom(id obj) {
     } @catch (__unused NSException *ex) {}
 }
 
-#pragma mark - UI marker
-
-static NSAttributedString *MVBuildMarkedAttributed(NSString *raw) {
-    NSString *base = MVStripMarkers(raw ?: @"");
-    NSMutableAttributedString *out = [[NSMutableAttributedString alloc] initWithString:base];
-    [out appendAttributedString:[[NSAttributedString alloc] initWithString:@"\n"]];
-    NSDictionary *attrs = @{
-        NSForegroundColorAttributeName: [UIColor redColor],
-        NSFontAttributeName: [UIFont italicSystemFontOfSize:UIFont.systemFontSize * 0.875],
-    };
-    [out appendAttributedString:[[NSAttributedString alloc] initWithString:kUiMarker attributes:attrs]];
-    return out;
-}
-
-static BOOL MVStringNeedsMarker(NSString *s) {
-    return [s isKindOfClass:[NSString class]] &&
-           ([s containsString:kDbMarker] || [s containsString:@"\ndeleted"] || [s containsString:@"\nудалено"]);
-}
-
 #pragma mark - Hooks
 
 @interface MaxVibeAntiDeleteHooks : NSObject
@@ -218,8 +232,6 @@ static BOOL MVStringNeedsMarker(NSString *s) {
 - (void)mvibe_messagesDeleted:(id)messages inChat:(id)chat;
 - (void)mvibe_messagesUpdated:(id)messages inTransaction:(id)tx;
 - (void)mvibe_messageReceived:(id)message;
-- (void)mvibe_setText:(NSString *)text;
-- (void)mvibe_setAttributedText:(NSAttributedString *)text;
 @end
 
 @implementation MaxVibeAntiDeleteHooks
@@ -240,10 +252,10 @@ static BOOL MVStringNeedsMarker(NSString *s) {
     NSMutableArray *allow = [NSMutableArray array];
     NSUInteger keep = 0;
     for (id pk in pks) {
-        if (MVPkLooksIncoming(pk)) {
+        if (MVPkLooksIncoming(pk) || [gDeletedPks containsObject:MVNormalizePk(pk)]) {
             keep++;
-            NSString *key = [pk isKindOfClass:[NSString class]] ? pk : [pk description];
-            [gDeletedPks addObject:key];
+            NSString *key = MVNormalizePk(pk);
+            if (key.length) [gDeletedPks addObject:key];
         } else {
             [allow addObject:pk];
         }
@@ -265,9 +277,9 @@ static BOOL MVStringNeedsMarker(NSString *s) {
     }
     NSMutableArray *allow = [NSMutableArray array];
     for (id pk in pks) {
-        if (MVPkLooksIncoming(pk)) {
-            NSString *key = [pk isKindOfClass:[NSString class]] ? pk : [pk description];
-            [gDeletedPks addObject:key];
+        if (MVPkLooksIncoming(pk) || [gDeletedPks containsObject:MVNormalizePk(pk)]) {
+            NSString *key = MVNormalizePk(pk);
+            if (key.length) [gDeletedPks addObject:key];
         } else {
             [allow addObject:pk];
         }
@@ -299,8 +311,9 @@ static BOOL MVStringNeedsMarker(NSString *s) {
             MVCacheMessage(item);
             if (MVIsIncomingMessage(item)) {
                 kept++;
-                // Tag in-memory only — never touch Yap from this hook.
-                @try { MVTagMessageAsDeleted(item); } @catch (__unused NSException *ex) {}
+                MVMarkMessageDeleted(item);
+                // Skip original delete = row stays. Marker re-applied on _messagesUpdated.
+                // Do not call Yap from PushCleanupHelper (no write connection here).
             } else {
                 [allow addObject:item];
             }
@@ -326,51 +339,36 @@ static BOOL MVStringNeedsMarker(NSString *s) {
         if (MVIsOKMMessage(item)) {
             MVCacheMessage(item);
             if (MVIsIncomingMessage(item)) {
-                @try { MVTagMessageAsDeleted(item); } @catch (__unused NSException *ex) {}
+                MVMarkMessageDeleted(item);
                 continue;
             }
-        } else if ([item isKindOfClass:[NSString class]] && MVPkLooksIncoming(item)) {
+        } else if ([item isKindOfClass:[NSString class]] &&
+                   (MVPkLooksIncoming(item) || [gDeletedPks containsObject:item])) {
             [gDeletedPks addObject:item];
             MVPersistDeletedPks();
             continue;
         }
         [allow addObject:item];
     }
-    MVLog(@"messagesDeleted keep-filtered allow=%lu", (unsigned long)allow.count);
+    MVLog(@"messagesDeleted allow=%lu", (unsigned long)allow.count);
     if (allow.count == 0) return;
     [self mvibe_messagesDeleted:allow inChat:chat];
 }
 
 - (void)mvibe_messagesUpdated:(id)messages inTransaction:(id)tx {
-    // Cache only — never rewrite here (Yap transaction context).
     if ([messages isKindOfClass:[NSArray class]]) {
-        for (id msg in (NSArray *)messages) MVCacheMessage(msg);
+        for (id msg in (NSArray *)messages) {
+            MVCacheMessage(msg);
+            if (MaxVibeAntiDeleteEnabled()) MVReapplyMarkerIfNeeded(msg);
+        }
     }
     [self mvibe_messagesUpdated:messages inTransaction:tx];
 }
 
 - (void)mvibe_messageReceived:(id)message {
     MVCacheMessage(message);
+    if (MaxVibeAntiDeleteEnabled()) MVReapplyMarkerIfNeeded(message);
     [self mvibe_messageReceived:message];
-}
-
-- (void)mvibe_setText:(NSString *)text {
-    if (MVStringNeedsMarker(text)) {
-        [self mvibe_setAttributedText:MVBuildMarkedAttributed(text)];
-        return;
-    }
-    [self mvibe_setText:text];
-}
-
-- (void)mvibe_setAttributedText:(NSAttributedString *)text {
-    if ([text isKindOfClass:[NSAttributedString class]] && MVStringNeedsMarker(text.string)) {
-        NSString *s = text.string;
-        if ([s containsString:kDbMarker] || [s containsString:@"\nудалено"]) {
-            [self mvibe_setAttributedText:MVBuildMarkedAttributed(s)];
-            return;
-        }
-    }
-    [self mvibe_setAttributedText:text];
 }
 
 @end
@@ -393,7 +391,8 @@ void MaxVibeInstallAntiDelete(void) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         MVEnsureStore();
-        MVLog(@"install begin (safe, no Yap) enabled=%d", MaxVibeAntiDeleteEnabled());
+        MVLog(@"install begin v2 (update+❌, no Yap/UILabel swizzle) enabled=%d",
+              MaxVibeAntiDeleteEnabled());
 
         Class creds = NSClassFromString(@"OKMMessengerCredentials");
         MVLog(@"setCurrentUserId: %s",
@@ -425,9 +424,6 @@ void MaxVibeInstallAntiDelete(void) {
         MVLog(@"_messageReceived: %s",
               MVExchange(incoming, NSSelectorFromString(@"_messageReceived:"),
                          @selector(mvibe_messageReceived:)) ? "OK" : "FAIL");
-
-        MVExchange([UILabel class], @selector(setText:), @selector(mvibe_setText:));
-        MVExchange([UILabel class], @selector(setAttributedText:), @selector(mvibe_setAttributedText:));
 
         MVLog(@"install done my=%@", gMyUserId);
     });
