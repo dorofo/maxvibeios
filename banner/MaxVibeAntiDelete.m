@@ -84,33 +84,51 @@ static NSString *MVPkOfMessage(id msg) {
     return nil;
 }
 
+static NSNumber *MVNumberize(id v) {
+    if ([v isKindOfClass:[NSNumber class]]) return v;
+    if ([v isKindOfClass:[NSString class]] && [(NSString *)v length]) {
+        return @([(NSString *)v longLongValue]);
+    }
+    return nil;
+}
+
 static NSNumber *MVSenderIdOfMessage(id msg) {
     @try {
-        id sid = [msg valueForKey:@"senderId"];
-        if ([sid isKindOfClass:[NSNumber class]]) return sid;
+        NSNumber *sid = MVNumberize([msg valueForKey:@"senderId"]);
+        if (sid) return sid;
+        sid = MVNumberize([msg valueForKey:@"authorId"]);
+        if (sid) return sid;
         id sender = [msg valueForKey:@"sender"];
+        if (!sender) sender = [msg valueForKey:@"senderContact"];
         if (sender) {
-            id sid2 = [sender valueForKey:@"id"];
-            if (!sid2) sid2 = [sender valueForKey:@"userId"];
-            if ([sid2 isKindOfClass:[NSNumber class]]) return sid2;
+            sid = MVNumberize([sender valueForKey:@"id"]);
+            if (!sid) sid = MVNumberize([sender valueForKey:@"userId"]);
+            if (!sid) sid = MVNumberize([sender valueForKey:@"contactId"]);
+            if (sid) return sid;
         }
     } @catch (__unused NSException *ex) {}
     return nil;
 }
 
+/**
+ * Prefer senderId vs myUserId — isIncoming/outgoing on deleted payloads are unreliable
+ * (v6 log: peer delete hit handleDeletedMessages with keep=0).
+ */
 static BOOL MVMessageIsIncoming(id msg) {
     if (!MVIsOKMMessage(msg)) return NO;
-    @try {
-        id inc = [msg valueForKey:@"isIncoming"];
-        if ([inc respondsToSelector:@selector(boolValue)]) return [inc boolValue];
-    } @catch (__unused NSException *ex) {}
+    NSNumber *sender = MVSenderIdOfMessage(msg);
+    if (gMyUserId && sender) {
+        return sender.unsignedLongLongValue != gMyUserId.unsignedLongLongValue;
+    }
     @try {
         id outg = [msg valueForKey:@"outgoing"];
         if ([outg respondsToSelector:@selector(boolValue)]) return ![outg boolValue];
     } @catch (__unused NSException *ex) {}
-    NSNumber *sender = MVSenderIdOfMessage(msg);
-    if (!gMyUserId || !sender) return NO;
-    return sender.unsignedLongLongValue != gMyUserId.unsignedLongLongValue;
+    @try {
+        id inc = [msg valueForKey:@"isIncoming"];
+        if ([inc respondsToSelector:@selector(boolValue)]) return [inc boolValue];
+    } @catch (__unused NSException *ex) {}
+    return NO;
 }
 
 static NSString *MVPlainTextOfMessage(id msg) {
@@ -365,6 +383,9 @@ static void mvibe_handleDeletedMessages(id self, SEL _cmd, id messages, id chatI
     NSMutableArray *allow = [NSMutableArray array];
     NSUInteger kept = 0;
     for (id item in list) {
+        MVLog(@"item class=%@ okm=%d pk=%@ sender=%@ incoming=%d",
+              NSStringFromClass([item class]), MVIsOKMMessage(item),
+              MVPkOfMessage(item), MVSenderIdOfMessage(item), MVMessageIsIncoming(item));
         if (MVMessageIsIncoming(item)) {
             kept++;
             MVConvertDeleteToUpdate(self, item);
@@ -427,7 +448,7 @@ void MaxVibeInstallAntiDelete(void) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         MVEnsureStore();
-        MVLog(@"install begin v6 (no ChatService hooks) enabled=%d", MaxVibeAntiDeleteEnabled());
+        MVLog(@"install begin v6.1 (senderId-first incoming) enabled=%d", MaxVibeAntiDeleteEnabled());
 
         Class creds = NSClassFromString(@"OKMMessengerCredentials");
         MVLog(@"setCurrentUserId: %s",
