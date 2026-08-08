@@ -1,0 +1,10 @@
+_unpacked/
+_temp.zip
+*.ipa
+*.zip
+dist/
+MaxVibeBanner.dylib
+.DS_Store
+__pycache__/
+*.pyc
+.venv/

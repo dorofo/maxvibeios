@@ -1,0 +1,45 @@
+name: Build MaxVibeBanner dylib
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build arm64 dylib
+        run: |
+          set -euo pipefail
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          echo "SDK=$SDK"
+          clang -dynamiclib \
+            -arch arm64 \
+            -isysroot "$SDK" \
+            -miphoneos-version-min=15.0 \
+            -fobjc-arc \
+            -framework Foundation \
+            -framework UIKit \
+            -install_name "@executable_path/Frameworks/MaxVibeBanner.dylib" \
+            -o MaxVibeBanner.dylib \
+            banner/MaxVibeBanner.m
+          lipo -info MaxVibeBanner.dylib
+          ls -la MaxVibeBanner.dylib
+
+      - name: Package artifact
+        run: |
+          mkdir -p dist
+          cp MaxVibeBanner.dylib dist/
+          cp banner/banner_character.png dist/
+          cp scripts/inject_banner.py dist/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MaxVibeBanner-dylib
+          path: dist/
+          if-no-files-found: error
