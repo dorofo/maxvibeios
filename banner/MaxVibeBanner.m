@@ -15,7 +15,7 @@ static NSString * const kKeyLast = @"mvibe_banner_last_show_time";
 static NSString * const kKeyBannerEnabled = @"mvibe_banner_enabled";
 static const NSTimeInterval kDaySeconds = 86400.0;
 static const NSTimeInterval kFetchTimeout = 4.0;
-static const NSTimeInterval kInitialDelay = 6.0;
+static const NSTimeInterval kInitialDelay = 8.0;
 
 static BOOL gDidSchedule = NO;
 static BOOL gShowingBanner = NO;
@@ -121,75 +121,85 @@ static char kMvibeSettingsRowKey;
     });
 }
 
-#pragma mark - Hook Settings UI
+#pragma mark - Hook Settings UI (NO Swift viewDidAppear swizzle — that crashed ~1s)
 
-static void MVExchangeInstance(Class cls, SEL origSel, SEL swizSel) {
-    if (!cls) return;
-    Method orig = class_getInstanceMethod(cls, origSel);
-    Method swiz = class_getInstanceMethod(cls, swizSel);
-    if (!orig || !swiz) return;
-    method_exchangeImplementations(orig, swiz);
+- (UIViewController *)mvibe_topViewController {
+    UIViewController *top = [self keyWindow].rootViewController;
+    if (!top) return nil;
+    while (top.presentedViewController) top = top.presentedViewController;
+    if ([top isKindOfClass:[UITabBarController class]]) {
+        top = ((UITabBarController *)top).selectedViewController;
+    }
+    if ([top isKindOfClass:[UINavigationController class]]) {
+        top = ((UINavigationController *)top).visibleViewController;
+    }
+    // Dive into child containers once more
+    if ([top isKindOfClass:[UINavigationController class]]) {
+        top = ((UINavigationController *)top).visibleViewController;
+    }
+    return top;
 }
 
 - (void)installSettingsHooks {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
-        // Main settings list only (О приложении / Помощь / бизнес…)
-        Class settingsVC = NSClassFromString(@"_TtC10SettingsUI22SettingsViewController");
-        [self swizzleViewDidAppearOn:settingsVC];
+        // Safe: swizzle ObjC UINavigationController, not Swift Settings VC
+        Class nav = [UINavigationController class];
+        SEL orig = @selector(pushViewController:animated:);
+        SEL swiz = @selector(mvibe_pushViewController:animated:);
+        Method mOrig = class_getInstanceMethod(nav, orig);
+        Method mDonor = class_getInstanceMethod([MaxVibeModController class], swiz);
+        if (mOrig && mDonor) {
+            class_addMethod(nav, swiz, method_getImplementation(mDonor), method_getTypeEncoding(mDonor));
+            method_exchangeImplementations(class_getInstanceMethod(nav, orig),
+                                           class_getInstanceMethod(nav, swiz));
+        }
 
-        [[NSNotificationCenter defaultCenter] addObserver:self
-                                                 selector:@selector(onAnyTransition)
-                                                     name:UIApplicationDidBecomeActiveNotification
-                                                   object:nil];
+        SEL origSet = @selector(setViewControllers:animated:);
+        SEL swizSet = @selector(mvibe_setViewControllers:animated:);
+        Method mOrigSet = class_getInstanceMethod(nav, origSet);
+        Method mDonorSet = class_getInstanceMethod([MaxVibeModController class], swizSet);
+        if (mOrigSet && mDonorSet) {
+            class_addMethod(nav, swizSet, method_getImplementation(mDonorSet), method_getTypeEncoding(mDonorSet));
+            method_exchangeImplementations(class_getInstanceMethod(nav, origSet),
+                                           class_getInstanceMethod(nav, swizSet));
+        }
+
+        // Slow poll as backup (does nothing unless Settings is visible)
+        [NSTimer scheduledTimerWithTimeInterval:1.5
+                                         target:self
+                                       selector:@selector(pollForSettingsScreen)
+                                       userInfo:nil
+                                        repeats:YES];
     });
 }
 
-- (void)swizzleViewDidAppearOn:(Class)cls {
-    if (!cls) return;
-    SEL orig = @selector(viewDidAppear:);
-    SEL swiz = @selector(mvibe_viewDidAppear:);
-    Method mOrig = class_getInstanceMethod(cls, orig);
-    Method mDonor = class_getInstanceMethod([self class], swiz);
-    if (!mOrig || !mDonor) return;
-
-    IMP donorImp = method_getImplementation(mDonor);
-    const char *types = method_getTypeEncoding(mDonor);
-    class_addMethod(cls, swiz, donorImp, types);
-
-    Method mSwiz = class_getInstanceMethod(cls, swiz);
-    if (mOrig && mSwiz) method_exchangeImplementations(mOrig, mSwiz);
+- (void)mvibe_pushViewController:(UIViewController *)vc animated:(BOOL)animated {
+    [(UINavigationController *)self mvibe_pushViewController:vc animated:animated];
+    if ([NSStringFromClass([vc class]) containsString:@"SettingsViewController"]) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            [[MaxVibeModController shared] attachSettingsRowToViewController:vc];
+        });
+    }
 }
 
-- (void)mvibe_viewDidAppear:(BOOL)animated {
-    [self mvibe_viewDidAppear:animated];
-    UIViewController *vc = (UIViewController *)self;
-    if (![vc isKindOfClass:[UIViewController class]]) return;
-    // Delay so list finishes layout; attach at END as footer
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        [[MaxVibeModController shared] attachSettingsRowToViewController:vc];
-    });
+- (void)mvibe_setViewControllers:(NSArray *)vcs animated:(BOOL)animated {
+    [(UINavigationController *)self mvibe_setViewControllers:vcs animated:animated];
+    UIViewController *top = vcs.lastObject;
+    if ([NSStringFromClass([top class]) containsString:@"SettingsViewController"]) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            [[MaxVibeModController shared] attachSettingsRowToViewController:top];
+        });
+    }
 }
 
-- (void)onAnyTransition {
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        UIViewController *top = [self keyWindow].rootViewController;
-        while (top.presentedViewController) top = top.presentedViewController;
-        if ([top isKindOfClass:[UINavigationController class]]) {
-            top = ((UINavigationController *)top).visibleViewController;
-        }
-        if ([top isKindOfClass:[UITabBarController class]]) {
-            top = ((UITabBarController *)top).selectedViewController;
-            if ([top isKindOfClass:[UINavigationController class]]) {
-                top = ((UINavigationController *)top).visibleViewController;
-            }
-        }
-        if ([NSStringFromClass([top class]) containsString:@"SettingsViewController"]) {
-            [self attachSettingsRowToViewController:top];
-        }
-    });
+- (void)pollForSettingsScreen {
+    UIViewController *top = [self mvibe_topViewController];
+    if ([NSStringFromClass([top class]) containsString:@"SettingsViewController"]) {
+        [self attachSettingsRowToViewController:top];
+    }
 }
 
 - (UIScrollView *)findBestScrollView:(UIView *)root {

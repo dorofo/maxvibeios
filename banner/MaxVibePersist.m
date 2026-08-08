@@ -5,18 +5,16 @@
 #import "fishhook.h"
 
 /*
- * Session persist for TrollStore/decrypted IPA.
- * Critical: ONLY rebind inside the main executable — rebinding SecItem inside
- * Security.framework (all-images fishhook) caused the ~2s crash.
+ * Session persist: rebind SecItem ONLY in main image.
+ * Only CopyMatching + Add (Update/Delete hooks were extra crash surface).
  */
 
 static OSStatus (*orig_SecItemCopyMatching)(CFDictionaryRef, CFTypeRef *) = NULL;
 static OSStatus (*orig_SecItemAdd)(CFDictionaryRef, CFTypeRef *) = NULL;
-static OSStatus (*orig_SecItemUpdate)(CFDictionaryRef, CFDictionaryRef) = NULL;
-static OSStatus (*orig_SecItemDelete)(CFDictionaryRef) = NULL;
 
 static CFMutableDictionaryRef MVStripAccessGroup(CFDictionaryRef dict) {
     if (!dict) return NULL;
+    if (CFGetTypeID(dict) != CFDictionaryGetTypeID()) return NULL;
     CFMutableDictionaryRef m = CFDictionaryCreateMutableCopy(kCFAllocatorDefault, 0, dict);
     if (!m) return NULL;
     CFDictionaryRemoveValue(m, kSecAttrAccessGroup);
@@ -43,29 +41,6 @@ static OSStatus mv_SecItemAdd(CFDictionaryRef attributes, CFTypeRef *result) {
         if (st == errSecSuccess || st == errSecDuplicateItem) return st;
     }
     return orig_SecItemAdd(attributes, result);
-}
-
-static OSStatus mv_SecItemUpdate(CFDictionaryRef query, CFDictionaryRef attrsToUpdate) {
-    if (!orig_SecItemUpdate) return errSecParam;
-    CFMutableDictionaryRef q = MVStripAccessGroup(query);
-    CFMutableDictionaryRef a = MVStripAccessGroup(attrsToUpdate);
-    OSStatus st = errSecParam;
-    if (q && a) st = orig_SecItemUpdate(q, a);
-    if (q) CFRelease(q);
-    if (a) CFRelease(a);
-    if (st == errSecSuccess) return st;
-    return orig_SecItemUpdate(query, attrsToUpdate);
-}
-
-static OSStatus mv_SecItemDelete(CFDictionaryRef query) {
-    if (!orig_SecItemDelete) return errSecParam;
-    CFMutableDictionaryRef stripped = MVStripAccessGroup(query);
-    if (stripped) {
-        OSStatus st = orig_SecItemDelete(stripped);
-        CFRelease(stripped);
-        if (st == errSecSuccess || st == errSecItemNotFound) return st;
-    }
-    return orig_SecItemDelete(query);
 }
 
 static NSString *MVRedirectSuiteName(NSString *suiteName) {
@@ -99,12 +74,9 @@ static void MVRebindMainImageOnly(void) {
     const struct mach_header *hdr = _dyld_get_image_header(0);
     intptr_t slide = _dyld_get_image_vmaddr_slide(0);
     if (!hdr) return;
-
     struct rebinding rebs[] = {
         {"SecItemCopyMatching", (void *)mv_SecItemCopyMatching, (void **)&orig_SecItemCopyMatching},
         {"SecItemAdd", (void *)mv_SecItemAdd, (void **)&orig_SecItemAdd},
-        {"SecItemUpdate", (void *)mv_SecItemUpdate, (void **)&orig_SecItemUpdate},
-        {"SecItemDelete", (void *)mv_SecItemDelete, (void **)&orig_SecItemDelete},
     };
     rebind_symbols_image((void *)hdr, slide, rebs, sizeof(rebs) / sizeof(rebs[0]));
 }
