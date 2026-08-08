@@ -8,11 +8,14 @@
 
 static NSString * const kConfigURL = @"https://dorofo.github.io/max-vibe-assets/config.json";
 static NSString * const kTelegramURL = @"https://t.me/max_vibe";
-static NSString * const kPrefsSuite = @"mvibe_banner_prefs";
-static NSString * const kKeyFirst = @"first_launch";
-static NSString * const kKeyLast = @"last_show_time";
+/* Use standard defaults with prefixed keys — custom suites can break container access. */
+static NSString * const kKeyFirst = @"mvibe_banner_first_launch";
+static NSString * const kKeyLast = @"mvibe_banner_last_show_time";
 static const NSTimeInterval kDaySeconds = 86400.0;
 static const NSTimeInterval kFetchTimeout = 4.0;
+/* Wait for app session/keychain restore before touching the UI. */
+static const NSTimeInterval kInitialDelay = 5.0;
+static const NSTimeInterval kActiveDelay = 3.0;
 
 static BOOL gDidSchedule = NO;
 static BOOL gShowing = NO;
@@ -37,17 +40,14 @@ static BOOL gShowing = NO;
 }
 
 - (NSUserDefaults *)prefs {
-    return [[NSUserDefaults alloc] initWithSuiteName:kPrefsSuite] ?: [NSUserDefaults standardUserDefaults];
+    return [NSUserDefaults standardUserDefaults];
 }
 
 - (BOOL)shouldShow {
     NSUserDefaults *p = [self prefs];
-    BOOL first = [p objectForKey:kKeyFirst] == nil ? YES : [p boolForKey:kKeyFirst];
-    // Mirror Android: KEY_FIRST defaults to true; after dismiss we set false.
+    BOOL first = YES;
     if ([p objectForKey:kKeyFirst] != nil) {
         first = [p boolForKey:kKeyFirst];
-    } else {
-        first = YES;
     }
     NSTimeInterval last = [p doubleForKey:kKeyLast];
     NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
@@ -61,7 +61,6 @@ static BOOL gShowing = NO;
     NSUserDefaults *p = [self prefs];
     [p setBool:NO forKey:kKeyFirst];
     [p setDouble:[[NSDate date] timeIntervalSince1970] forKey:kKeyLast];
-    [p synchronize];
 }
 
 - (void)start {
@@ -73,15 +72,15 @@ static BOOL gShowing = NO;
                                                  name:UIApplicationDidBecomeActiveNotification
                                                object:nil];
 
-    // Also try shortly after load in case we missed the first active.
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
+    // Delay so messenger can restore session/keychain before we overlay UI.
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kInitialDelay * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         [self tryPresent];
     });
 }
 
 - (void)onActive:(NSNotification *)note {
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)),
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kActiveDelay * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         [self tryPresent];
     });
