@@ -25,7 +25,7 @@ static NSString * const kDbMarker = @"\ndeletel";
 
 static NSNumber *gMyUserId = nil;
 static NSMutableSet *gDeletedPks = nil;
-static id gWriteConnection = nil; // retained YapDatabaseConnection
+static __strong id gWriteConnection = nil; // YapDatabaseConnection
 
 static IMP gOrigSetUserId = NULL;
 static IMP gOrigHandleDeleted = NULL;
