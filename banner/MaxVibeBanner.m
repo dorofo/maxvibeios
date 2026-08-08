@@ -1,9 +1,9 @@
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
-#import <AudioToolbox/AudioToolbox.h>
+#import <objc/runtime.h>
 
 /*
- * MaxVibe injected mod: Telegram banner + Settings sheet + persist hooks.
+ * MaxVibe: Telegram banner + native Settings row + soft persist fix.
  */
 
 extern void MaxVibeInstallPersistFixes(void);
@@ -13,28 +13,26 @@ static NSString * const kTelegramURL = @"https://t.me/max_vibe";
 static NSString * const kKeyFirst = @"mvibe_banner_first_launch";
 static NSString * const kKeyLast = @"mvibe_banner_last_show_time";
 static NSString * const kKeyBannerEnabled = @"mvibe_banner_enabled";
-static NSString * const kKeyFabVisible = @"mvibe_fab_visible";
 static const NSTimeInterval kDaySeconds = 86400.0;
 static const NSTimeInterval kFetchTimeout = 4.0;
-static const NSTimeInterval kInitialDelay = 5.0;
-static const NSTimeInterval kActiveDelay = 3.0;
+static const NSTimeInterval kInitialDelay = 6.0;
 
 static BOOL gDidSchedule = NO;
 static BOOL gShowingBanner = NO;
 static BOOL gShowingSettings = NO;
+static char kMvibeSettingsRowKey;
 
 @interface MaxVibeModController : NSObject
 + (instancetype)shared;
 - (void)start;
 - (void)openTelegram;
 - (void)showSettings;
-- (BOOL)bannerEnabled;
+- (void)attachSettingsRowToViewController:(UIViewController *)vc;
 @end
 
 @implementation MaxVibeModController {
     UIView *_bannerOverlay;
     UIView *_settingsOverlay;
-    UIButton *_fab;
 }
 
 + (instancetype)shared {
@@ -51,10 +49,7 @@ static BOOL gShowingSettings = NO;
     if ([p objectForKey:kKeyBannerEnabled] == nil) return YES;
     return [p boolForKey:kKeyBannerEnabled];
 }
-
-- (void)setBannerEnabled:(BOOL)on {
-    [[self prefs] setBool:on forKey:kKeyBannerEnabled];
-}
+- (void)setBannerEnabled:(BOOL)on { [[self prefs] setBool:on forKey:kKeyBannerEnabled]; }
 
 - (BOOL)shouldShowBanner {
     if (![self bannerEnabled]) return NO;
@@ -73,11 +68,10 @@ static BOOL gShowingSettings = NO;
     [p setDouble:[[NSDate date] timeIntervalSince1970] forKey:kKeyLast];
 }
 
-- (UIColor *)colorFromHex:(unsigned int)hex alpha:(CGFloat)a {
+- (UIColor *)hex:(unsigned int)hex alpha:(CGFloat)a {
     return [UIColor colorWithRed:((hex >> 16) & 0xFF) / 255.0
                            green:((hex >> 8) & 0xFF) / 255.0
-                            blue:(hex & 0xFF) / 255.0
-                           alpha:a];
+                            blue:(hex & 0xFF) / 255.0 alpha:a];
 }
 
 - (UIWindow *)keyWindow {
@@ -86,10 +80,8 @@ static BOOL gShowingSettings = NO;
             if (scene.activationState != UISceneActivationStateForegroundActive) continue;
             if (![scene isKindOfClass:[UIWindowScene class]]) continue;
             UIWindowScene *ws = (UIWindowScene *)scene;
-            for (UIWindow *w in ws.windows) {
-                if (w.isKeyWindow) return w;
-            }
-            if (ws.windows.count > 0) return ws.windows.firstObject;
+            for (UIWindow *w in ws.windows) if (w.isKeyWindow) return w;
+            if (ws.windows.count) return ws.windows.firstObject;
         }
     }
 #pragma clang diagnostic push
@@ -100,11 +92,7 @@ static BOOL gShowingSettings = NO;
 
 - (UIImage *)bannerImage {
     NSBundle *main = [NSBundle mainBundle];
-    NSArray<NSString *> *rels = @[
-        @"banner_character.png",
-        @"Frameworks/banner_character.png",
-    ];
-    for (NSString *rel in rels) {
+    for (NSString *rel in @[@"banner_character.png", @"Frameworks/banner_character.png"]) {
         NSString *path = [main.bundlePath stringByAppendingPathComponent:rel];
         if ([[NSFileManager defaultManager] fileExistsAtPath:path]) {
             UIImage *img = [UIImage imageWithContentsOfFile:path];
@@ -116,92 +104,221 @@ static BOOL gShowingSettings = NO;
 
 - (void)openTelegram {
     NSURL *url = [NSURL URLWithString:kTelegramURL];
-    UIApplication *app = UIApplication.sharedApplication;
     if (@available(iOS 10.0, *)) {
-        [app openURL:url options:@{} completionHandler:nil];
-    } else {
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated-declarations"
-        [app openURL:url];
-#pragma clang diagnostic pop
+        [UIApplication.sharedApplication openURL:url options:@{} completionHandler:nil];
     }
 }
 
 - (void)start {
     if (gDidSchedule) return;
     gDidSchedule = YES;
-
     MaxVibeInstallPersistFixes();
-
-    [[NSNotificationCenter defaultCenter] addObserver:self
-                                             selector:@selector(onActive:)
-                                                 name:UIApplicationDidBecomeActiveNotification
-                                               object:nil];
+    [self installSettingsHooks];
 
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kInitialDelay * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
-        [self ensureFab];
         [self tryPresentBanner];
     });
 }
 
-- (void)onActive:(NSNotification *)note {
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kActiveDelay * NSEC_PER_SEC)),
+#pragma mark - Hook Settings UI
+
+static void MVExchangeInstance(Class cls, SEL origSel, SEL swizSel) {
+    if (!cls) return;
+    Method orig = class_getInstanceMethod(cls, origSel);
+    Method swiz = class_getInstanceMethod(cls, swizSel);
+    if (!orig || !swiz) return;
+    method_exchangeImplementations(orig, swiz);
+}
+
+- (void)installSettingsHooks {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        // Add helper methods onto target VCs via class_addMethod from our class, then swizzle.
+        Class settingsVC = NSClassFromString(@"_TtC10SettingsUI22SettingsViewController");
+        Class aboutVC = NSClassFromString(@"_TtC10SettingsUI15AboutController");
+        Class genericVC = NSClassFromString(@"_TtC10SettingsUI28GenericSettingsViewController");
+        // GenericSettingsViewController mangled length may differ — try common names
+        if (!genericVC) genericVC = NSClassFromString(@"_TtC10SettingsUI27GenericSettingsViewController");
+
+        [self swizzleViewDidAppearOn:settingsVC];
+        [self swizzleViewDidAppearOn:aboutVC];
+        [self swizzleViewDidAppearOn:genericVC];
+
+        // Also observe navigation transitions as fallback
+        [[NSNotificationCenter defaultCenter] addObserver:self
+                                                 selector:@selector(onAnyTransition)
+                                                     name:UIApplicationDidBecomeActiveNotification
+                                                   object:nil];
+    });
+}
+
+- (void)swizzleViewDidAppearOn:(Class)cls {
+    if (!cls) return;
+    SEL orig = @selector(viewDidAppear:);
+    SEL swiz = @selector(mvibe_viewDidAppear:);
+    Method mOrig = class_getInstanceMethod(cls, orig);
+    Method mDonor = class_getInstanceMethod([self class], swiz);
+    if (!mOrig || !mDonor) return;
+
+    // Add donor IMP to target class under swiz name if needed
+    IMP donorImp = method_getImplementation(mDonor);
+    const char *types = method_getTypeEncoding(mDonor);
+    class_addMethod(cls, swiz, donorImp, types);
+
+    Method mSwiz = class_getInstanceMethod(cls, swiz);
+    if (mOrig && mSwiz) method_exchangeImplementations(mOrig, mSwiz);
+}
+
+- (void)mvibe_viewDidAppear:(BOOL)animated {
+    // After exchange, this IMP runs for Settings VC; calling mvibe_viewDidAppear hits original.
+    [self mvibe_viewDidAppear:animated];
+    UIViewController *vc = (UIViewController *)self;
+    if (![vc isKindOfClass:[UIViewController class]]) return;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [[MaxVibeModController shared] attachSettingsRowToViewController:vc];
+    });
+}
+
+- (void)onAnyTransition {
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
-        [self ensureFab];
-        [self tryPresentBanner];
+        UIViewController *root = [self keyWindow].rootViewController;
+        UIViewController *top = root;
+        while (top.presentedViewController) top = top.presentedViewController;
+        if ([top isKindOfClass:[UINavigationController class]]) {
+            top = ((UINavigationController *)top).visibleViewController;
+        }
+        if ([top isKindOfClass:[UITabBarController class]]) {
+            top = ((UITabBarController *)top).selectedViewController;
+            if ([top isKindOfClass:[UINavigationController class]]) {
+                top = ((UINavigationController *)top).visibleViewController;
+            }
+        }
+        NSString *name = NSStringFromClass([top class]);
+        if ([name containsString:@"SettingsViewController"] ||
+            [name containsString:@"AboutController"] ||
+            [name containsString:@"GenericSettings"]) {
+            [self attachSettingsRowToViewController:top];
+        }
     });
 }
 
-#pragma mark - FAB (open settings)
-
-- (void)ensureFab {
-    UIWindow *window = [self keyWindow];
-    if (!window) return;
-    if (_fab && _fab.superview) return;
-
-    UIButton *fab = [UIButton buttonWithType:UIButtonTypeSystem];
-    fab.frame = CGRectMake(window.bounds.size.width - 58, window.bounds.size.height * 0.62, 46, 46);
-    fab.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleTopMargin | UIViewAutoresizingFlexibleBottomMargin;
-    fab.backgroundColor = [self colorFromHex:0xE85A7A alpha:0.92];
-    fab.layer.cornerRadius = 23;
-    fab.layer.shadowColor = [UIColor blackColor].CGColor;
-    fab.layer.shadowOpacity = 0.35;
-    fab.layer.shadowRadius = 8;
-    fab.layer.shadowOffset = CGSizeMake(0, 3);
-    [fab setTitle:@"MV" forState:UIControlStateNormal];
-    [fab setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-    fab.titleLabel.font = [UIFont boldSystemFontOfSize:13];
-    [fab addTarget:self action:@selector(showSettings) forControlEvents:UIControlEventTouchUpInside];
-
-    UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(onFabPan:)];
-    [fab addGestureRecognizer:pan];
-
-    [window addSubview:fab];
-    _fab = fab;
-}
-
-- (void)onFabPan:(UIPanGestureRecognizer *)gr {
-    UIView *v = gr.view;
-    UIView *parent = v.superview;
-    if (!parent) return;
-    CGPoint t = [gr translationInView:parent];
-    v.center = CGPointMake(v.center.x + t.x, v.center.y + t.y);
-    [gr setTranslation:CGPointZero inView:parent];
-    if (gr.state == UIGestureRecognizerStateEnded) {
-        CGFloat x = v.center.x < parent.bounds.size.width * 0.5 ? 28 : parent.bounds.size.width - 28;
-        [UIView animateWithDuration:0.2 animations:^{
-            v.center = CGPointMake(x, MIN(MAX(v.center.y, 80), parent.bounds.size.height - 80));
-        }];
+- (UIScrollView *)findScrollView:(UIView *)root {
+    if ([root isKindOfClass:[UIScrollView class]]) return (UIScrollView *)root;
+    for (UIView *v in root.subviews) {
+        UIScrollView *s = [self findScrollView:v];
+        if (s) return s;
     }
+    return nil;
 }
 
-#pragma mark - Settings MaxVibe
+- (UIView *)buildSettingsRow {
+    UIControl *row = [[UIControl alloc] initWithFrame:CGRectMake(0, 0, 320, 56)];
+    row.backgroundColor = [[UIColor labelColor] colorWithAlphaComponent:0.06];
+    if (@available(iOS 13.0, *)) {
+        row.backgroundColor = [UIColor secondarySystemGroupedBackgroundColor];
+    }
+    row.layer.cornerRadius = 14;
+    row.clipsToBounds = YES;
+    [row addTarget:self action:@selector(showSettings) forControlEvents:UIControlEventTouchUpInside];
 
-- (UIView *)settingsRowTitle:(NSString *)title
-                    subtitle:(NSString *)subtitle
-                      action:(SEL)action
-                    showChevron:(BOOL)chevron {
+    UILabel *title = [[UILabel alloc] init];
+    title.text = @"Настройки MaxVibe";
+    title.font = [UIFont systemFontOfSize:17 weight:UIFontWeightRegular];
+    title.textColor = [UIColor labelColor];
+    title.translatesAutoresizingMaskIntoConstraints = NO;
+
+    UILabel *chev = [[UILabel alloc] init];
+    chev.text = @"›";
+    chev.font = [UIFont systemFontOfSize:24 weight:UIFontWeightLight];
+    chev.textColor = [UIColor tertiaryLabelColor];
+    chev.translatesAutoresizingMaskIntoConstraints = NO;
+
+    UIView *dot = [[UIView alloc] init];
+    dot.backgroundColor = [self hex:0xE85A7A alpha:1];
+    dot.layer.cornerRadius = 4;
+    dot.translatesAutoresizingMaskIntoConstraints = NO;
+
+    [row addSubview:dot];
+    [row addSubview:title];
+    [row addSubview:chev];
+    [NSLayoutConstraint activateConstraints:@[
+        [dot.leadingAnchor constraintEqualToAnchor:row.leadingAnchor constant:16],
+        [dot.centerYAnchor constraintEqualToAnchor:row.centerYAnchor],
+        [dot.widthAnchor constraintEqualToConstant:8],
+        [dot.heightAnchor constraintEqualToConstant:8],
+        [title.leadingAnchor constraintEqualToAnchor:dot.trailingAnchor constant:12],
+        [title.centerYAnchor constraintEqualToAnchor:row.centerYAnchor],
+        [chev.trailingAnchor constraintEqualToAnchor:row.trailingAnchor constant:-14],
+        [chev.centerYAnchor constraintEqualToAnchor:row.centerYAnchor],
+        [title.trailingAnchor constraintLessThanOrEqualToAnchor:chev.leadingAnchor constant:-8],
+        [row.heightAnchor constraintEqualToConstant:56],
+    ]];
+    return row;
+}
+
+- (void)attachSettingsRowToViewController:(UIViewController *)vc {
+    if (!vc || !vc.isViewLoaded) return;
+    if (objc_getAssociatedObject(vc, &kMvibeSettingsRowKey)) return;
+
+    NSString *cls = NSStringFromClass([vc class]);
+    BOOL isSettings = [cls containsString:@"SettingsViewController"] ||
+                      [cls containsString:@"AboutController"] ||
+                      [cls containsString:@"GenericSettings"];
+    if (!isSettings) return;
+
+    UIView *row = [self buildSettingsRow];
+    row.translatesAutoresizingMaskIntoConstraints = NO;
+
+    UITableView *table = nil;
+    UIScrollView *scroll = [self findScrollView:vc.view];
+    if ([scroll isKindOfClass:[UITableView class]]) table = (UITableView *)scroll;
+
+    if (table) {
+        CGFloat w = MAX(table.bounds.size.width, vc.view.bounds.size.width);
+        CGFloat extra = 72;
+        UIView *old = table.tableHeaderView;
+        CGFloat oldH = old ? old.bounds.size.height : 0;
+        UIView *wrap = [[UIView alloc] initWithFrame:CGRectMake(0, 0, w, oldH + extra)];
+        if (old) {
+            old.frame = CGRectMake(0, 0, w, oldH);
+            [wrap addSubview:old];
+        }
+        [wrap addSubview:row];
+        [NSLayoutConstraint activateConstraints:@[
+            [row.leadingAnchor constraintEqualToAnchor:wrap.leadingAnchor constant:16],
+            [row.trailingAnchor constraintEqualToAnchor:wrap.trailingAnchor constant:-16],
+            [row.bottomAnchor constraintEqualToAnchor:wrap.bottomAnchor constant:-8],
+            [row.heightAnchor constraintEqualToConstant:56],
+        ]];
+        // layout wrap width for tableHeaderView
+        wrap.frame = CGRectMake(0, 0, w, oldH + extra);
+        [wrap setNeedsLayout];
+        [wrap layoutIfNeeded];
+        CGFloat h = oldH + extra;
+        wrap.frame = CGRectMake(0, 0, w, h);
+        table.tableHeaderView = wrap;
+    } else {
+        // Fallback: pin under safe area (looks like first settings item)
+        [vc.view addSubview:row];
+        [NSLayoutConstraint activateConstraints:@[
+            [row.leadingAnchor constraintEqualToAnchor:vc.view.safeAreaLayoutGuide.leadingAnchor constant:16],
+            [row.trailingAnchor constraintEqualToAnchor:vc.view.safeAreaLayoutGuide.trailingAnchor constant:-16],
+            [row.topAnchor constraintEqualToAnchor:vc.view.safeAreaLayoutGuide.topAnchor constant:8],
+            [row.heightAnchor constraintEqualToConstant:56],
+        ]];
+        UIEdgeInsets insets = vc.additionalSafeAreaInsets;
+        insets.top = MAX(insets.top, 72);
+        vc.additionalSafeAreaInsets = insets;
+    }
+
+    objc_setAssociatedObject(vc, &kMvibeSettingsRowKey, row, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+#pragma mark - Settings sheet
+
+- (UIView *)settingsRowTitle:(NSString *)title subtitle:(NSString *)subtitle action:(SEL)action chevron:(BOOL)chevron {
     UIButton *row = [UIButton buttonWithType:UIButtonTypeCustom];
     row.translatesAutoresizingMaskIntoConstraints = NO;
     row.backgroundColor = [[UIColor whiteColor] colorWithAlphaComponent:0.06];
@@ -209,23 +326,14 @@ static BOOL gShowingSettings = NO;
     [row addTarget:self action:action forControlEvents:UIControlEventTouchUpInside];
 
     UILabel *t = [[UILabel alloc] init];
-    t.text = title;
-    t.textColor = [UIColor whiteColor];
+    t.text = title; t.textColor = UIColor.whiteColor;
     t.font = [UIFont systemFontOfSize:16 weight:UIFontWeightSemibold];
-    t.translatesAutoresizingMaskIntoConstraints = NO;
-    t.userInteractionEnabled = NO;
-
+    t.translatesAutoresizingMaskIntoConstraints = NO; t.userInteractionEnabled = NO;
     UILabel *s = [[UILabel alloc] init];
-    s.text = subtitle;
-    s.textColor = [self colorFromHex:0x8E858A alpha:1];
-    s.font = [UIFont systemFontOfSize:12];
-    s.numberOfLines = 2;
-    s.translatesAutoresizingMaskIntoConstraints = NO;
-    s.userInteractionEnabled = NO;
-
-    [row addSubview:t];
-    [row addSubview:s];
-
+    s.text = subtitle; s.textColor = [self hex:0x8E858A alpha:1];
+    s.font = [UIFont systemFontOfSize:12]; s.numberOfLines = 2;
+    s.translatesAutoresizingMaskIntoConstraints = NO; s.userInteractionEnabled = NO;
+    [row addSubview:t]; [row addSubview:s];
     [NSLayoutConstraint activateConstraints:@[
         [row.heightAnchor constraintGreaterThanOrEqualToConstant:64],
         [t.topAnchor constraintEqualToAnchor:row.topAnchor constant:12],
@@ -236,14 +344,11 @@ static BOOL gShowingSettings = NO;
         [s.trailingAnchor constraintEqualToAnchor:t.trailingAnchor],
         [s.bottomAnchor constraintEqualToAnchor:row.bottomAnchor constant:-12],
     ]];
-
     if (chevron) {
         UILabel *ch = [[UILabel alloc] init];
-        ch.text = @"›";
-        ch.textColor = [self colorFromHex:0xE8C4CE alpha:1];
+        ch.text = @"›"; ch.textColor = [self hex:0xE8C4CE alpha:1];
         ch.font = [UIFont systemFontOfSize:28 weight:UIFontWeightLight];
-        ch.translatesAutoresizingMaskIntoConstraints = NO;
-        ch.userInteractionEnabled = NO;
+        ch.translatesAutoresizingMaskIntoConstraints = NO; ch.userInteractionEnabled = NO;
         [row addSubview:ch];
         [NSLayoutConstraint activateConstraints:@[
             [ch.centerYAnchor constraintEqualToAnchor:row.centerYAnchor],
@@ -258,7 +363,6 @@ static BOOL gShowingSettings = NO;
     UIWindow *window = [self keyWindow];
     if (!window) return;
     gShowingSettings = YES;
-    AudioServicesPlaySystemSound(1519);
 
     UIView *overlay = [[UIView alloc] initWithFrame:window.bounds];
     overlay.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
@@ -266,85 +370,46 @@ static BOOL gShowingSettings = NO;
 
     UIView *card = [[UIView alloc] init];
     card.translatesAutoresizingMaskIntoConstraints = NO;
-    card.backgroundColor = [self colorFromHex:0x1A1218 alpha:1];
-    card.layer.cornerRadius = 22;
-    card.clipsToBounds = YES;
+    card.backgroundColor = [self hex:0x1A1218 alpha:1];
+    card.layer.cornerRadius = 22; card.clipsToBounds = YES;
 
     UILabel *kicker = [[UILabel alloc] init];
-    kicker.text = @"МОД НА MAX";
-    kicker.textColor = [self colorFromHex:0xE85A7A alpha:1];
+    kicker.text = @"МОД НА MAX"; kicker.textColor = [self hex:0xE85A7A alpha:1];
     kicker.font = [UIFont systemFontOfSize:11 weight:UIFontWeightBold];
     kicker.translatesAutoresizingMaskIntoConstraints = NO;
-
     UILabel *title = [[UILabel alloc] init];
-    title.text = @"Настройки MaxVibe";
-    title.textColor = [self colorFromHex:0xE8C4CE alpha:1];
+    title.text = @"Настройки MaxVibe"; title.textColor = [self hex:0xE8C4CE alpha:1];
     title.font = [UIFont systemFontOfSize:24 weight:UIFontWeightBold];
     title.translatesAutoresizingMaskIntoConstraints = NO;
-
     UILabel *sub = [[UILabel alloc] init];
-    sub.text = @"листайте ниже · persist fix активен";
-    sub.textColor = [self colorFromHex:0x8E858A alpha:1];
-    sub.font = [UIFont systemFontOfSize:12];
-    sub.translatesAutoresizingMaskIntoConstraints = NO;
+    sub.text = @"как на Android · Telegram и баннер"; sub.textColor = [self hex:0x8E858A alpha:1];
+    sub.font = [UIFont systemFontOfSize:12]; sub.translatesAutoresizingMaskIntoConstraints = NO;
 
     UIImageView *hero = [[UIImageView alloc] initWithImage:[self bannerImage]];
-    hero.contentMode = UIViewContentModeScaleAspectFit;
-    hero.translatesAutoresizingMaskIntoConstraints = NO;
+    hero.contentMode = UIViewContentModeScaleAspectFit; hero.translatesAutoresizingMaskIntoConstraints = NO;
 
     UIButton *close = [UIButton buttonWithType:UIButtonTypeSystem];
     [close setTitle:@"✕" forState:UIControlStateNormal];
-    [close setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    [close setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
     close.titleLabel.font = [UIFont boldSystemFontOfSize:16];
     close.backgroundColor = [[UIColor whiteColor] colorWithAlphaComponent:0.15];
-    close.layer.cornerRadius = 18;
-    close.translatesAutoresizingMaskIntoConstraints = NO;
+    close.layer.cornerRadius = 18; close.translatesAutoresizingMaskIntoConstraints = NO;
     [close addTarget:self action:@selector(dismissSettings) forControlEvents:UIControlEventTouchUpInside];
 
-    UIScrollView *scroll = [[UIScrollView alloc] init];
-    scroll.translatesAutoresizingMaskIntoConstraints = NO;
+    UIScrollView *scroll = [[UIScrollView alloc] init]; scroll.translatesAutoresizingMaskIntoConstraints = NO;
     UIStackView *stack = [[UIStackView alloc] init];
-    stack.axis = UILayoutConstraintAxisVertical;
-    stack.spacing = 10;
-    stack.translatesAutoresizingMaskIntoConstraints = NO;
+    stack.axis = UILayoutConstraintAxisVertical; stack.spacing = 10; stack.translatesAutoresizingMaskIntoConstraints = NO;
 
-    UIView *tg = [self settingsRowTitle:@"Telegram канал"
-                               subtitle:@"Подписаться · t.me/max_vibe"
-                                 action:@selector(onSettingsTelegram)
-                             showChevron:YES];
-    UIView *ban = [self settingsRowTitle:[self bannerEnabled] ? @"Баннер: включён" : @"Баннер: выключен"
-                                subtitle:@"Показ стартового баннера раз в сутки"
-                                  action:@selector(onSettingsToggleBanner)
-                              showChevron:NO];
-    ban.tag = 9001;
-    UIView *force = [self settingsRowTitle:@"Показать баннер сейчас"
-                                  subtitle:@"Сбросить таймер и открыть"
-                                    action:@selector(onSettingsForceBanner)
-                                showChevron:YES];
-    UIView *icon = [self settingsRowTitle:@"Сменить иконку"
-                                 subtitle:@"Скоро · пока только визуал"
-                                   action:@selector(onSettingsStubIcon)
-                               showChevron:YES];
-    UIView *acc = [self settingsRowTitle:@"Аккаунты"
-                                subtitle:@"Скоро · сменить / добавить"
-                                  action:@selector(onSettingsStubAccounts)
-                              showChevron:YES];
-
-    [stack addArrangedSubview:tg];
-    [stack addArrangedSubview:ban];
-    [stack addArrangedSubview:force];
-    [stack addArrangedSubview:icon];
-    [stack addArrangedSubview:acc];
+    [stack addArrangedSubview:[self settingsRowTitle:@"Telegram канал" subtitle:@"t.me/max_vibe" action:@selector(onSettingsTelegram) chevron:YES]];
+    [stack addArrangedSubview:[self settingsRowTitle:[self bannerEnabled] ? @"Баннер: включён" : @"Баннер: выключен" subtitle:@"Стартовый баннер раз в сутки" action:@selector(onSettingsToggleBanner) chevron:NO]];
+    [stack addArrangedSubview:[self settingsRowTitle:@"Показать баннер сейчас" subtitle:@"Сбросить таймер" action:@selector(onSettingsForceBanner) chevron:YES]];
+    [stack addArrangedSubview:[self settingsRowTitle:@"Сменить иконку" subtitle:@"Скоро" action:@selector(onSettingsStub) chevron:YES]];
+    [stack addArrangedSubview:[self settingsRowTitle:@"Аккаунты" subtitle:@"Скоро" action:@selector(onSettingsStub) chevron:YES]];
 
     [scroll addSubview:stack];
-    [card addSubview:kicker];
-    [card addSubview:title];
-    [card addSubview:sub];
-    [card addSubview:hero];
-    [card addSubview:close];
-    [card addSubview:scroll];
-    [overlay addSubview:card];
-    [window addSubview:overlay];
+    [card addSubview:kicker]; [card addSubview:title]; [card addSubview:sub];
+    [card addSubview:hero]; [card addSubview:close]; [card addSubview:scroll];
+    [overlay addSubview:card]; [window addSubview:overlay];
     _settingsOverlay = overlay;
 
     CGFloat width = MIN(window.bounds.size.width - 24, 400);
@@ -352,47 +417,32 @@ static BOOL gShowingSettings = NO;
         [card.centerXAnchor constraintEqualToAnchor:overlay.centerXAnchor],
         [card.centerYAnchor constraintEqualToAnchor:overlay.centerYAnchor],
         [card.widthAnchor constraintEqualToConstant:width],
-        [card.heightAnchor constraintLessThanOrEqualToAnchor:overlay.heightAnchor multiplier:0.88],
-
         [kicker.topAnchor constraintEqualToAnchor:card.topAnchor constant:18],
         [kicker.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:20],
-
         [close.topAnchor constraintEqualToAnchor:card.topAnchor constant:14],
         [close.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-14],
-        [close.widthAnchor constraintEqualToConstant:36],
-        [close.heightAnchor constraintEqualToConstant:36],
-
+        [close.widthAnchor constraintEqualToConstant:36], [close.heightAnchor constraintEqualToConstant:36],
         [title.topAnchor constraintEqualToAnchor:kicker.bottomAnchor constant:6],
         [title.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:20],
         [title.trailingAnchor constraintEqualToAnchor:close.leadingAnchor constant:-8],
-
         [sub.topAnchor constraintEqualToAnchor:title.bottomAnchor constant:4],
         [sub.leadingAnchor constraintEqualToAnchor:title.leadingAnchor],
-
         [hero.topAnchor constraintEqualToAnchor:sub.bottomAnchor constant:4],
         [hero.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-8],
-        [hero.widthAnchor constraintEqualToConstant:110],
-        [hero.heightAnchor constraintEqualToConstant:140],
-
+        [hero.widthAnchor constraintEqualToConstant:110], [hero.heightAnchor constraintEqualToConstant:140],
         [scroll.topAnchor constraintEqualToAnchor:sub.bottomAnchor constant:16],
         [scroll.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:16],
         [scroll.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-16],
         [scroll.bottomAnchor constraintEqualToAnchor:card.bottomAnchor constant:-18],
         [scroll.heightAnchor constraintEqualToConstant:320],
-
         [stack.topAnchor constraintEqualToAnchor:scroll.topAnchor],
         [stack.leadingAnchor constraintEqualToAnchor:scroll.leadingAnchor],
         [stack.trailingAnchor constraintEqualToAnchor:scroll.trailingAnchor],
         [stack.bottomAnchor constraintEqualToAnchor:scroll.bottomAnchor],
         [stack.widthAnchor constraintEqualToAnchor:scroll.widthAnchor],
     ]];
-
     overlay.alpha = 0;
-    card.transform = CGAffineTransformMakeScale(0.94, 0.94);
-    [UIView animateWithDuration:0.28 animations:^{
-        overlay.alpha = 1;
-        card.transform = CGAffineTransformIdentity;
-    }];
+    [UIView animateWithDuration:0.25 animations:^{ overlay.alpha = 1; }];
 }
 
 - (void)dismissSettings {
@@ -405,49 +455,23 @@ static BOOL gShowingSettings = NO;
     }];
 }
 
-- (void)onSettingsTelegram {
-    [self openTelegram];
-}
-
+- (void)onSettingsTelegram { [self openTelegram]; }
 - (void)onSettingsToggleBanner {
-    BOOL next = ![self bannerEnabled];
-    [self setBannerEnabled:next];
-    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"MaxVibe"
-                                                                message:next ? @"Баннер включён" : @"Баннер выключен"
-                                                         preferredStyle:UIAlertControllerStyleAlert];
-    [ac addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
-    UIViewController *root = [self keyWindow].rootViewController;
-    while (root.presentedViewController) root = root.presentedViewController;
-    [root presentViewController:ac animated:YES completion:nil];
+    [self setBannerEnabled:![self bannerEnabled]];
     [self dismissSettings];
 }
-
 - (void)onSettingsForceBanner {
-    NSUserDefaults *p = [self prefs];
-    [p setBool:YES forKey:kKeyFirst];
-    [p setDouble:0 forKey:kKeyLast];
+    [[self prefs] setBool:YES forKey:kKeyFirst];
+    [[self prefs] setDouble:0 forKey:kKeyLast];
     [self setBannerEnabled:YES];
     [self dismissSettings];
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         gShowingBanner = NO;
         [self tryPresentBanner];
     });
 }
-
-- (void)onSettingsStubIcon {
-    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"Сменить иконку"
-                                                                message:@"Пока недоступно на iOS. На Android уже есть."
-                                                         preferredStyle:UIAlertControllerStyleAlert];
-    [ac addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
-    UIViewController *root = [self keyWindow].rootViewController;
-    while (root.presentedViewController) root = root.presentedViewController;
-    [root presentViewController:ac animated:YES completion:nil];
-}
-
-- (void)onSettingsStubAccounts {
-    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"Аккаунты"
-                                                                message:@"Скоро. Пока используй системный переключатель аккаунтов MAX."
-                                                         preferredStyle:UIAlertControllerStyleAlert];
+- (void)onSettingsStub {
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"MaxVibe" message:@"Скоро появится" preferredStyle:UIAlertControllerStyleAlert];
     [ac addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
     UIViewController *root = [self keyWindow].rootViewController;
     while (root.presentedViewController) root = root.presentedViewController;
@@ -462,123 +486,76 @@ static BOOL gShowingSettings = NO;
     UIWindow *window = [self keyWindow];
     if (!window) return;
     gShowingBanner = YES;
-    [self fetchConfigThenShowOn:window];
-}
 
-- (void)fetchConfigThenShowOn:(UIWindow *)window {
     NSURL *url = [NSURL URLWithString:kConfigURL];
-    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url
-                                                       cachePolicy:NSURLRequestReloadIgnoringLocalCacheData
-                                                   timeoutInterval:kFetchTimeout];
+    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url cachePolicy:NSURLRequestReloadIgnoringLocalCacheData timeoutInterval:kFetchTimeout];
     [req setValue:@"MaxVibe/iOS" forHTTPHeaderField:@"User-Agent"];
-    [[[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
-        NSString *bannerText = nil;
-        BOOL validLauncher = YES;
-        if (!error && data.length > 0) {
+    [[[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
+        NSString *text = nil; BOOL valid = YES;
+        if (!err && data.length) {
             id obj = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
             if ([obj isKindOfClass:[NSDictionary class]]) {
-                NSDictionary *json = obj;
-                id vl = json[@"valid_launcher"];
-                if ([vl isKindOfClass:[NSNumber class]]) validLauncher = [vl boolValue];
-                id bt = json[@"banner_text"];
-                if ([bt isKindOfClass:[NSString class]] && [(NSString *)bt length] > 0) bannerText = bt;
+                NSDictionary *j = obj;
+                if ([j[@"valid_launcher"] isKindOfClass:[NSNumber class]]) valid = [j[@"valid_launcher"] boolValue];
+                if ([j[@"banner_text"] isKindOfClass:[NSString class]] && [j[@"banner_text"] length]) text = j[@"banner_text"];
             }
         }
         dispatch_async(dispatch_get_main_queue(), ^{
-            if (!validLauncher) [self showKillSwitchOn:window];
-            else [self showBannerOn:window message:bannerText];
+            if (!valid) {
+                UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"Лаунчер отключен" message:@"Обновитесь в телеграм-канале" preferredStyle:UIAlertControllerStyleAlert];
+                [ac addAction:[UIAlertAction actionWithTitle:@"Открыть Telegram" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ [self openTelegram]; gShowingBanner=NO; }]];
+                UIViewController *root = window.rootViewController;
+                while (root.presentedViewController) root = root.presentedViewController;
+                [root presentViewController:ac animated:YES completion:nil];
+                return;
+            }
+            [self showBannerOn:window message:text];
         });
     }] resume];
 }
 
-- (void)showKillSwitchOn:(UIWindow *)window {
-    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"Лаунчер отключен"
-                                                                message:@"Лаунчер отключен от работы, обновитесь в телеграм-канале"
-                                                         preferredStyle:UIAlertControllerStyleAlert];
-    [ac addAction:[UIAlertAction actionWithTitle:@"Обновиться в телеграм-канале"
-                                           style:UIAlertActionStyleDefault
-                                         handler:^(UIAlertAction *a) {
-        [self openTelegram];
-        gShowingBanner = NO;
-    }]];
-    UIViewController *root = window.rootViewController;
-    while (root.presentedViewController) root = root.presentedViewController;
-    [root presentViewController:ac animated:YES completion:nil];
-}
-
 - (void)showBannerOn:(UIWindow *)window message:(NSString *)message {
-    if (_bannerOverlay) { [_bannerOverlay removeFromSuperview]; _bannerOverlay = nil; }
-    NSString *text = message.length > 0 ? message : @"Подпишись на канал — обновления мода, фичи и вайб без воды";
+    NSString *text = message.length ? message : @"Подпишись на канал — обновления мода, фичи и вайб без воды";
     CGFloat width = MIN(window.bounds.size.width - 32, 360);
-
     UIView *overlay = [[UIView alloc] initWithFrame:window.bounds];
     overlay.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
     overlay.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.55];
-
     UIView *card = [[UIView alloc] init];
-    card.backgroundColor = [self colorFromHex:0x1A1218 alpha:1];
-    card.layer.cornerRadius = 20;
-    card.clipsToBounds = YES;
+    card.backgroundColor = [self hex:0x1A1218 alpha:1]; card.layer.cornerRadius = 20; card.clipsToBounds = YES;
     card.translatesAutoresizingMaskIntoConstraints = NO;
-
     UIImageView *hero = [[UIImageView alloc] initWithImage:[self bannerImage]];
-    hero.contentMode = UIViewContentModeScaleAspectFit;
-    hero.translatesAutoresizingMaskIntoConstraints = NO;
-
+    hero.contentMode = UIViewContentModeScaleAspectFit; hero.translatesAutoresizingMaskIntoConstraints = NO;
     UIButton *close = [UIButton buttonWithType:UIButtonTypeSystem];
-    [close setTitle:@"✕" forState:UIControlStateNormal];
-    [close setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    [close setTitle:@"✕" forState:UIControlStateNormal]; [close setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
     close.titleLabel.font = [UIFont boldSystemFontOfSize:16];
-    close.backgroundColor = [[UIColor whiteColor] colorWithAlphaComponent:0.18];
-    close.layer.cornerRadius = 20;
+    close.backgroundColor = [[UIColor whiteColor] colorWithAlphaComponent:0.18]; close.layer.cornerRadius = 20;
     close.translatesAutoresizingMaskIntoConstraints = NO;
     [close addTarget:self action:@selector(onBannerClose) forControlEvents:UIControlEventTouchUpInside];
-
     UILabel *title = [[UILabel alloc] init];
-    title.text = @"MaxVibe в Telegram";
-    title.textColor = [self colorFromHex:0xE8C4CE alpha:1];
-    title.font = [UIFont boldSystemFontOfSize:20];
-    title.textAlignment = NSTextAlignmentCenter;
-    title.translatesAutoresizingMaskIntoConstraints = NO;
-
+    title.text = @"MaxVibe в Telegram"; title.textColor = [self hex:0xE8C4CE alpha:1];
+    title.font = [UIFont boldSystemFontOfSize:20]; title.textAlignment = NSTextAlignmentCenter; title.translatesAutoresizingMaskIntoConstraints = NO;
     UILabel *msg = [[UILabel alloc] init];
-    msg.text = text;
-    msg.textColor = [self colorFromHex:0x8E858A alpha:1];
-    msg.font = [UIFont systemFontOfSize:14];
-    msg.textAlignment = NSTextAlignmentCenter;
-    msg.numberOfLines = 0;
-    msg.translatesAutoresizingMaskIntoConstraints = NO;
-
+    msg.text = text; msg.textColor = [self hex:0x8E858A alpha:1]; msg.font = [UIFont systemFontOfSize:14];
+    msg.textAlignment = NSTextAlignmentCenter; msg.numberOfLines = 0; msg.translatesAutoresizingMaskIntoConstraints = NO;
     UIButton *join = [UIButton buttonWithType:UIButtonTypeSystem];
     [join setTitle:@"Подписаться в Telegram" forState:UIControlStateNormal];
-    [join setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    [join setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
     join.titleLabel.font = [UIFont boldSystemFontOfSize:15];
-    join.backgroundColor = [self colorFromHex:0xE85A7A alpha:1];
-    join.layer.cornerRadius = 14;
+    join.backgroundColor = [self hex:0xE85A7A alpha:1]; join.layer.cornerRadius = 14;
     join.translatesAutoresizingMaskIntoConstraints = NO;
     [join addTarget:self action:@selector(onBannerJoin) forControlEvents:UIControlEventTouchUpInside];
-
-    [card addSubview:hero];
-    [card addSubview:close];
-    [card addSubview:title];
-    [card addSubview:msg];
-    [card addSubview:join];
-    [overlay addSubview:card];
-    [window addSubview:overlay];
-    _bannerOverlay = overlay;
-
+    [card addSubview:hero]; [card addSubview:close]; [card addSubview:title]; [card addSubview:msg]; [card addSubview:join];
+    [overlay addSubview:card]; [window addSubview:overlay]; _bannerOverlay = overlay;
     [NSLayoutConstraint activateConstraints:@[
         [card.centerXAnchor constraintEqualToAnchor:overlay.centerXAnchor],
         [card.centerYAnchor constraintEqualToAnchor:overlay.centerYAnchor],
         [card.widthAnchor constraintEqualToConstant:width],
         [hero.topAnchor constraintEqualToAnchor:card.topAnchor constant:8],
         [hero.centerXAnchor constraintEqualToAnchor:card.centerXAnchor],
-        [hero.widthAnchor constraintEqualToConstant:220],
-        [hero.heightAnchor constraintEqualToConstant:300],
+        [hero.widthAnchor constraintEqualToConstant:220], [hero.heightAnchor constraintEqualToConstant:300],
         [close.topAnchor constraintEqualToAnchor:card.topAnchor constant:12],
         [close.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-12],
-        [close.widthAnchor constraintEqualToConstant:40],
-        [close.heightAnchor constraintEqualToConstant:40],
+        [close.widthAnchor constraintEqualToConstant:40], [close.heightAnchor constraintEqualToConstant:40],
         [title.topAnchor constraintEqualToAnchor:hero.bottomAnchor constant:4],
         [title.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:24],
         [title.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-24],
@@ -591,42 +568,25 @@ static BOOL gShowingSettings = NO;
         [join.heightAnchor constraintEqualToConstant:52],
         [join.bottomAnchor constraintEqualToAnchor:card.bottomAnchor constant:-20],
     ]];
-
     overlay.alpha = 0;
-    card.transform = CGAffineTransformMakeScale(0.92, 0.92);
-    [UIView animateWithDuration:0.28 animations:^{
-        overlay.alpha = 1;
-        card.transform = CGAffineTransformIdentity;
-    }];
+    [UIView animateWithDuration:0.25 animations:^{ overlay.alpha = 1; }];
 }
 
 - (void)dismissBanner {
-    UIView *overlay = _bannerOverlay;
-    if (!overlay) { gShowingBanner = NO; return; }
-    [UIView animateWithDuration:0.2 animations:^{ overlay.alpha = 0; } completion:^(BOOL f) {
-        [overlay removeFromSuperview];
-        self->_bannerOverlay = nil;
-        gShowingBanner = NO;
+    UIView *o = _bannerOverlay;
+    if (!o) { gShowingBanner = NO; return; }
+    [UIView animateWithDuration:0.2 animations:^{ o.alpha = 0; } completion:^(BOOL f) {
+        [o removeFromSuperview]; self->_bannerOverlay = nil; gShowingBanner = NO;
     }];
 }
-
-- (void)onBannerClose {
-    [self markBannerShown];
-    [self dismissBanner];
-}
-
-- (void)onBannerJoin {
-    [self markBannerShown];
-    [self openTelegram];
-    [self dismissBanner];
-}
+- (void)onBannerClose { [self markBannerShown]; [self dismissBanner]; }
+- (void)onBannerJoin { [self markBannerShown]; [self openTelegram]; [self dismissBanner]; }
 
 @end
 
 __attribute__((constructor))
 static void MaxVibeModInit(void) {
     @autoreleasepool {
-        // Persist hooks ASAP (before app touches keychain / app-group defaults)
         MaxVibeInstallPersistFixes();
         dispatch_async(dispatch_get_main_queue(), ^{
             [[MaxVibeModController shared] start];

@@ -26,16 +26,13 @@ jobs:
             -framework UIKit \
             -framework CoreGraphics \
             -framework QuartzCore \
-            -framework Security \
-            -framework AudioToolbox \
             -install_name "@executable_path/Frameworks/MaxVibeBanner.dylib" \
             -o MaxVibeBanner.dylib \
-            banner/fishhook.c \
             banner/MaxVibePersist.m \
             banner/MaxVibeBanner.m
+          # fishhook intentionally omitted — caused crashes on launch
           lipo -info MaxVibeBanner.dylib
           ls -la MaxVibeBanner.dylib
-          nm -gU MaxVibeBanner.dylib | head -40 || true
 
       - name: Package artifact
         run: |
