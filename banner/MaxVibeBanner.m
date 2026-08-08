@@ -30,6 +30,11 @@ static char kMvibeSettingsRowKey;
 - (void)attachSettingsRowToViewController:(UIViewController *)vc;
 @end
 
+@interface UINavigationController (MaxVibe)
+- (void)mvibe_pushViewController:(UIViewController *)vc animated:(BOOL)animated;
+- (void)mvibe_setViewControllers:(NSArray *)vcs animated:(BOOL)animated;
+@end
+
 @implementation MaxVibeModController {
     UIView *_bannerOverlay;
     UIView *_settingsOverlay;
