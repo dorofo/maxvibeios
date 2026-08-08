@@ -21,15 +21,21 @@ jobs:
             -target arm64-apple-ios15.0 \
             -isysroot "$SDK" \
             -fobjc-arc \
+            -I banner \
             -framework Foundation \
             -framework UIKit \
             -framework CoreGraphics \
             -framework QuartzCore \
+            -framework Security \
+            -framework AudioToolbox \
             -install_name "@executable_path/Frameworks/MaxVibeBanner.dylib" \
             -o MaxVibeBanner.dylib \
+            banner/fishhook.c \
+            banner/MaxVibePersist.m \
             banner/MaxVibeBanner.m
           lipo -info MaxVibeBanner.dylib
           ls -la MaxVibeBanner.dylib
+          nm -gU MaxVibeBanner.dylib | head -40 || true
 
       - name: Package artifact
         run: |
