@@ -285,6 +285,129 @@ static void MVTryLearnCredentialsFrom(id obj) {
     } @catch (__unused NSException *ex) {}
 }
 
+/** YES if pk refers to an incoming message (prefer keep when unknown). */
+static BOOL MVPkLooksIncoming(id pkOrKey) {
+    if (!pkOrKey) return YES;
+    NSString *key = nil;
+    if ([pkOrKey isKindOfClass:[NSString class]]) key = pkOrKey;
+    else if ([pkOrKey respondsToSelector:@selector(stringValue)]) key = [pkOrKey stringValue];
+    else key = [pkOrKey description];
+
+    NSDictionary *c = gMsgCache[key];
+    if (!c) {
+        for (NSString *k in gMsgCache) {
+            id sid = gMsgCache[k][@"serverId"];
+            if (sid && [sid isEqual:pkOrKey]) { c = gMsgCache[k]; key = k; break; }
+            if (sid && [[sid description] isEqualToString:key]) { c = gMsgCache[k]; key = k; break; }
+        }
+    }
+    if (!c) return YES; // not cached — keep (safer for peer deletes)
+    NSNumber *sender = c[@"senderId"];
+    if (!gMyUserId || !sender) return YES;
+    return sender.unsignedLongLongValue != gMyUserId.unsignedLongLongValue;
+}
+
+static void MVTryPersistMessage(id host, id msg) {
+    if (!msg) return;
+    // Best-effort: find a Yap write connection on host / deps and save.
+    NSArray *keys = @[
+        @"dbWriteConnection", @"writeConnection", @"rwConnection",
+        @"_dbWriteConnection", @"_writeConnection", @"connection",
+        @"databaseConnection", @"yapConnection"
+    ];
+    id conn = nil;
+    for (NSString *k in keys) {
+        @try { conn = [host valueForKey:k]; } @catch (__unused NSException *e) { conn = nil; }
+        if (conn) break;
+    }
+    if (!conn) {
+        @try {
+            id deps = [host valueForKey:@"dependencies"];
+            for (NSString *k in keys) {
+                @try { conn = [deps valueForKey:k]; } @catch (__unused NSException *e) { conn = nil; }
+                if (conn) break;
+            }
+        } @catch (__unused NSException *e) {}
+    }
+    if (!conn) {
+        MVLog(@"persist skipped (no connection) pk=%@", MVPkOfMessage(msg));
+        return;
+    }
+    SEL rw = NSSelectorFromString(@"readWriteWithBlock:");
+    if (![conn respondsToSelector:rw]) {
+        MVLog(@"persist skipped (no readWriteWithBlock) pk=%@", MVPkOfMessage(msg));
+        return;
+    }
+    @try {
+        void (^block)(id) = ^(id tx) {
+            @try {
+                SEL save = NSSelectorFromString(@"okm_saveMessage:");
+                if ([tx respondsToSelector:save]) {
+                    ((void (*)(id, SEL, id))objc_msgSend)(tx, save, msg);
+                } else {
+                    NSString *pk = MVPkOfMessage(msg);
+                    if (pk) {
+                        ((void (*)(id, SEL, id, id, id))objc_msgSend)(
+                            tx, @selector(setObject:forKey:inCollection:), msg, pk, @"messages");
+                    }
+                }
+            } @catch (__unused NSException *ex) {}
+        };
+        ((void (*)(id, SEL, id))objc_msgSend)(conn, rw, block);
+        MVLog(@"persist ok pk=%@", MVPkOfMessage(msg));
+    } @catch (__unused NSException *ex) {
+        MVLog(@"persist failed pk=%@", MVPkOfMessage(msg));
+    }
+}
+
+static id MVLoadMessageByPk(id host, id pk) {
+    if (!host || !pk) return nil;
+    NSArray *keys = @[@"dbReadConnection", @"readConnection", @"_dbReadConnection",
+                      @"dbWriteConnection", @"writeConnection", @"connection"];
+    id conn = nil;
+    for (NSString *k in keys) {
+        @try { conn = [host valueForKey:k]; } @catch (__unused NSException *e) { conn = nil; }
+        if (conn) break;
+    }
+    if (!conn) return nil;
+    __block id found = nil;
+    SEL readSel = NSSelectorFromString(@"readWithBlock:");
+    if (![conn respondsToSelector:readSel]) return nil;
+    void (^block)(id) = ^(id tx) {
+        @try {
+            SEL m1 = NSSelectorFromString(@"okm_messageForPk:");
+            if ([tx respondsToSelector:m1]) {
+                found = ((id (*)(id, SEL, id))objc_msgSend)(tx, m1, pk);
+            }
+            if (!found) {
+                NSString *key = [pk isKindOfClass:[NSString class]] ? pk : [pk description];
+                found = ((id (*)(id, SEL, id, id))objc_msgSend)(tx, @selector(objectForKey:inCollection:), key, @"messages");
+            }
+        } @catch (__unused NSException *ex) {}
+    };
+    @try {
+        ((void (*)(id, SEL, id))objc_msgSend)(conn, readSel, block);
+    } @catch (__unused NSException *ex) {}
+    return found;
+}
+
+static void MVKeepIncomingPk(id host, id pk) {
+    NSString *key = [pk isKindOfClass:[NSString class]] ? pk : [pk description];
+    MVMarkDeletedPk(key);
+    id msg = MVLoadMessageByPk(host, pk);
+    if (!msg && [pk isKindOfClass:[NSNumber class]]) {
+        msg = MVLoadMessageByPk(host, key);
+    }
+    if (MVIsOKMMessage(msg)) {
+        @try {
+            MVTagMessageAsDeleted(msg);
+            MVTryPersistMessage(host, msg);
+        } @catch (__unused NSException *ex) {}
+    } else {
+        MVLog(@"keep pk=%@ (no msg object to tag)", key);
+    }
+}
+
 static BOOL MVLooksLikeMessagesCollection(NSString *collection) {
     if (![collection isKindOfClass:[NSString class]] || !collection.length) return NO;
     if ([gMessageCollections containsObject:collection]) return YES;
@@ -587,10 +710,32 @@ static NSAttributedString *MVApplyMarkerToAttributed(NSAttributedString *attr) {
 - (void)mvibe_deleteMessagesWithPks:(NSArray *)pks deleteForAll:(BOOL)deleteForAll {
     MVEnsureStore();
     MVTryLearnCredentialsFrom(self);
-    MVLog(@"deleteMessagesWithPks count=%lu forAll=%d", (unsigned long)pks.count, deleteForAll);
+    if (![pks isKindOfClass:[NSArray class]]) {
+        [self mvibe_deleteMessagesWithPks:pks deleteForAll:deleteForAll];
+        return;
+    }
+    NSArray *allow = pks;
+    if (MaxVibeAntiDeleteEnabled()) {
+        NSMutableArray *out = [NSMutableArray array];
+        NSMutableArray *kept = [NSMutableArray array];
+        for (id pk in pks) {
+            if (MVPkLooksIncoming(pk)) [kept addObject:pk];
+            else [out addObject:pk];
+        }
+        MVLog(@"deleteMessagesWithPks total=%lu keep=%lu allow=%lu forAll=%d my=%@",
+              (unsigned long)pks.count, (unsigned long)kept.count, (unsigned long)out.count,
+              deleteForAll, gMyUserId);
+        for (id pk in kept) {
+            MVKeepIncomingPk(self, pk);
+        }
+        allow = out;
+        if (allow.count == 0) return; // nothing to delete via app — kept locally
+    } else {
+        MVLog(@"deleteMessagesWithPks count=%lu forAll=%d (off)", (unsigned long)pks.count, deleteForAll);
+    }
     gDeleteDepth++;
     @try {
-        [self mvibe_deleteMessagesWithPks:pks deleteForAll:deleteForAll];
+        [self mvibe_deleteMessagesWithPks:allow deleteForAll:deleteForAll];
     } @finally {
         gDeleteDepth--;
     }
@@ -599,10 +744,28 @@ static NSAttributedString *MVApplyMarkerToAttributed(NSAttributedString *attr) {
 - (void)mvibe__deleteMessagesWithPks:(NSArray *)pks deleteForAll:(BOOL)deleteForAll enqueueTasks:(BOOL)enqueueTasks {
     MVEnsureStore();
     MVTryLearnCredentialsFrom(self);
-    MVLog(@"_deleteMessagesWithPks count=%lu forAll=%d", (unsigned long)pks.count, deleteForAll);
+    if (![pks isKindOfClass:[NSArray class]]) {
+        [self mvibe__deleteMessagesWithPks:pks deleteForAll:deleteForAll enqueueTasks:enqueueTasks];
+        return;
+    }
+    NSArray *allow = pks;
+    if (MaxVibeAntiDeleteEnabled()) {
+        NSMutableArray *out = [NSMutableArray array];
+        for (id pk in pks) {
+            if (MVPkLooksIncoming(pk)) {
+                MVKeepIncomingPk(self, pk);
+            } else {
+                [out addObject:pk];
+            }
+        }
+        MVLog(@"_deleteMessagesWithPks total=%lu allow=%lu forAll=%d",
+              (unsigned long)pks.count, (unsigned long)out.count, deleteForAll);
+        allow = out;
+        if (allow.count == 0) return;
+    }
     gDeleteDepth++;
     @try {
-        [self mvibe__deleteMessagesWithPks:pks deleteForAll:deleteForAll enqueueTasks:enqueueTasks];
+        [self mvibe__deleteMessagesWithPks:allow deleteForAll:deleteForAll enqueueTasks:enqueueTasks];
     } @finally {
         gDeleteDepth--;
     }
@@ -611,81 +774,107 @@ static NSAttributedString *MVApplyMarkerToAttributed(NSAttributedString *attr) {
 - (void)mvibe_messagesUpdated:(id)messages inTransaction:(id)tx {
     MVEnsureStore();
     MVTryLearnCredentialsFrom(self);
-    BOOL anyRemoved = NO;
-    if ([messages isKindOfClass:[NSArray class]]) {
+    // Only rewrite already-removed incoming; do not mutate unrelated updates.
+    if (MaxVibeAntiDeleteEnabled() && [messages isKindOfClass:[NSArray class]]) {
         for (id msg in (NSArray *)messages) {
-            if (!MVIsOKMMessage(msg)) continue;
-            NSDictionary *prev = nil;
-            NSString *pk = MVPkOfMessage(msg);
-            if (pk) prev = [gMsgCache[pk] copy];
-            MVCacheMessage(msg);
+            if (!MVIsOKMMessage(msg) || !MVIsIncomingMessage(msg)) continue;
             NSInteger st = MVStatusOfMessage(msg);
-            if (st == 10 || (gRemovedStatus >= 0 && st == gRemovedStatus) || MVIsDeletedPk(pk)) {
-                anyRemoved = YES;
+            if (st == 10 || (gRemovedStatus >= 0 && st == gRemovedStatus) || MVIsDeletedPk(MVPkOfMessage(msg))) {
+                @try { MVRewriteIfNeeded(msg); } @catch (__unused NSException *ex) {}
+            } else {
+                MVCacheMessage(msg);
             }
-            if (MaxVibeAntiDeleteEnabled() && MVIsIncomingMessage(msg) &&
-                (st == 10 || (gRemovedStatus >= 0 && st == gRemovedStatus) || gDeleteDepth > 0)) {
-                MVRewriteIfNeeded(msg);
-            }
-            (void)prev;
         }
     }
-    if (anyRemoved) gDeleteDepth++;
-    @try {
-        [self mvibe_messagesUpdated:messages inTransaction:tx];
-    } @finally {
-        if (anyRemoved) gDeleteDepth--;
-    }
+    [self mvibe_messagesUpdated:messages inTransaction:tx];
 }
 
 - (void)mvibe_handleDeletedMessages:(id)messages inChatWithId:(id)chatId {
     MVEnsureStore();
     MVTryLearnCredentialsFrom(self);
-    MVLog(@"handleDeletedMessages chat=%@ msgs=%@", chatId, messages);
-    gDeleteDepth++;
-    @try {
-        // Try to retag before/while original runs
-        if (MaxVibeAntiDeleteEnabled()) {
-            NSArray *list = nil;
-            if ([messages isKindOfClass:[NSArray class]]) list = messages;
-            else if ([messages respondsToSelector:@selector(allObjects)]) list = [messages allObjects];
-            for (id item in list) {
-                id msg = item;
-                if (!MVIsOKMMessage(msg) && [item isKindOfClass:[NSString class]]) {
-                    // pk string — mark deleted id; rewrite happens on subsequent save/remove
-                    MVMarkDeletedPk(item);
-                    continue;
-                }
-                if (!MVIsOKMMessage(msg) && [item isKindOfClass:[NSNumber class]]) {
-                    continue;
-                }
-                if (MVIsOKMMessage(msg) && MVIsIncomingMessage(msg)) {
-                    MVRewriteIfNeeded(msg);
-                }
-            }
-        }
+
+    NSArray *list = nil;
+    if ([messages isKindOfClass:[NSArray class]]) list = messages;
+    else if ([messages respondsToSelector:@selector(allObjects)]) list = [messages allObjects];
+
+    MVLog(@"handleDeletedMessages chat=%@ count=%lu my=%@", chatId, (unsigned long)list.count, gMyUserId);
+
+    if (!MaxVibeAntiDeleteEnabled() || !list) {
         [self mvibe_handleDeletedMessages:messages inChatWithId:chatId];
-    } @finally {
-        gDeleteDepth--;
+        return;
     }
+
+    NSMutableArray *allow = [NSMutableArray array];
+    NSMutableArray *kept = [NSMutableArray array];
+    for (id item in list) {
+        if (MVIsOKMMessage(item)) {
+            MVCacheMessage(item);
+            if (MVIsIncomingMessage(item)) [kept addObject:item];
+            else [allow addObject:item];
+        } else if ([item isKindOfClass:[NSString class]] || [item isKindOfClass:[NSNumber class]]) {
+            if (MVPkLooksIncoming(item)) {
+                NSString *key = [item isKindOfClass:[NSString class]] ? item : [item description];
+                MVMarkDeletedPk(key);
+            } else {
+                [allow addObject:item];
+            }
+        } else {
+            [allow addObject:item];
+        }
+    }
+
+    MVLog(@"handleDeletedMessages keep=%lu allow=%lu", (unsigned long)kept.count, (unsigned long)allow.count);
+
+    // Tag kept messages WITHOUT feeding them to the original delete pipeline
+    // (mutating then calling original caused SIGSEGV at 0x10).
+    for (id msg in kept) {
+        @try {
+            MVTagMessageAsDeleted(msg);
+            MVMarkDeletedPk(MVPkOfMessage(msg));
+            MVTryPersistMessage(self, msg);
+        } @catch (__unused NSException *ex) {
+            MVLog(@"tag/persist failed pk=%@", MVPkOfMessage(msg));
+        }
+    }
+
+    if (allow.count == 0) {
+        MVLog(@"handleDeletedMessages skipped original (all kept)");
+        return;
+    }
+    [self mvibe_handleDeletedMessages:allow inChatWithId:chatId];
 }
 
 - (void)mvibe_messagesDeleted:(id)messages inChat:(id)chat {
     MVEnsureStore();
     MVTryLearnCredentialsFrom(self);
     MVLog(@"messagesDeleted chat=%@ msgs=%@", chat, messages);
-    gDeleteDepth++;
-    @try {
-        if (MaxVibeAntiDeleteEnabled() && [messages isKindOfClass:[NSArray class]]) {
-            for (id item in (NSArray *)messages) {
-                if ([item isKindOfClass:[NSString class]]) MVMarkDeletedPk(item);
-                else if (MVIsOKMMessage(item) && MVIsIncomingMessage(item)) MVRewriteIfNeeded(item);
-            }
-        }
+
+    if (!MaxVibeAntiDeleteEnabled()) {
         [self mvibe_messagesDeleted:messages inChat:chat];
-    } @finally {
-        gDeleteDepth--;
+        return;
     }
+
+    NSArray *list = [messages isKindOfClass:[NSArray class]] ? messages : nil;
+    if (!list) {
+        [self mvibe_messagesDeleted:messages inChat:chat];
+        return;
+    }
+    NSMutableArray *allow = [NSMutableArray array];
+    for (id item in list) {
+        if (MVIsOKMMessage(item) && MVIsIncomingMessage(item)) {
+            @try {
+                MVTagMessageAsDeleted(item);
+                MVMarkDeletedPk(MVPkOfMessage(item));
+                MVTryPersistMessage(self, item);
+            } @catch (__unused NSException *ex) {}
+        } else if ([item isKindOfClass:[NSString class]] && MVPkLooksIncoming(item)) {
+            MVMarkDeletedPk(item);
+        } else {
+            [allow addObject:item];
+        }
+    }
+    if (allow.count == 0) return;
+    [self mvibe_messagesDeleted:allow inChat:chat];
 }
 
 - (void)mvibe_setText:(NSString *)text {
@@ -709,38 +898,26 @@ static BOOL MVSwizzleInstance(Class target, SEL original, SEL donorSel) {
     Method donor = class_getInstanceMethod([MaxVibeAntiDeleteHooks class], donorSel);
     Method orig = class_getInstanceMethod(target, original);
     if (!donor || !orig) return NO;
-    const char *types = method_getTypeEncoding(orig);
-    if (!class_addMethod(target, donorSel, method_getImplementation(donor), types)) {
-        // donorSel already exists on target — still try exchange with existing
+    // Only swizzle if this class itself implements the method (not inherited).
+    unsigned int count = 0;
+    Method *list = class_copyMethodList(target, &count);
+    BOOL owns = NO;
+    for (unsigned int i = 0; i < count; i++) {
+        if (method_getName(list[i]) == original) { owns = YES; break; }
     }
+    if (list) free(list);
+    if (!owns) return NO;
+
+    const char *types = method_getTypeEncoding(orig);
+    class_addMethod(target, donorSel, method_getImplementation(donor), types);
     Method added = class_getInstanceMethod(target, donorSel);
     if (!added) return NO;
     method_exchangeImplementations(orig, added);
     return YES;
 }
 
-static void MVSwizzleAllClasses(SEL original, SEL donorSel, NSString *label) {
-    int n = objc_getClassList(NULL, 0);
-    if (n <= 0) return;
-    Class *classes = (Class *)malloc((size_t)n * sizeof(Class));
-    if (!classes) return;
-    n = objc_getClassList(classes, n);
-    int hits = 0;
-    for (int i = 0; i < n; i++) {
-        Class cls = classes[i];
-        Method m = class_getInstanceMethod(cls, original);
-        if (!m) continue;
-        // Only swizzle the class that implements it (not just inherits)
-        Method own = class_getInstanceMethod(cls, original);
-        Method superM = class_getInstanceMethod(class_getSuperclass(cls), original);
-        if (superM && method_getImplementation(own) == method_getImplementation(superM)) continue;
-        if (MVSwizzleInstance(cls, original, donorSel)) {
-            hits++;
-            MVLog(@"swizzled %@ on %s", label, class_getName(cls));
-        }
-    }
-    free(classes);
-    if (!hits) MVLog(@"no class for %@", label);
+static void MVLogSwizzle(BOOL ok, Class cls, NSString *sel) {
+    MVLog(@"swizzle %@: %s -> %s", sel, cls ? class_getName(cls) : "(nil)", ok ? "OK" : "FAIL");
 }
 
 void MaxVibeInstallAntiDelete(void) {
@@ -751,53 +928,137 @@ void MaxVibeInstallAntiDelete(void) {
 
         Class yapRW = NSClassFromString(@"YapDatabaseReadWriteTransaction");
         Class yapR = NSClassFromString(@"YapDatabaseReadTransaction");
+        MVLog(@"yapRW=%s yapR=%s", yapRW ? class_getName(yapRW) : "nil",
+              yapR ? class_getName(yapR) : "nil");
 
-        MVSwizzleInstance(yapRW, NSSelectorFromString(@"okm_saveMessage:"),
-                          @selector(mvibe_okm_saveMessage:));
-        MVSwizzleInstance(yapR ?: yapRW, NSSelectorFromString(@"okm_messageForPk:"),
-                          @selector(mvibe_okm_messageForPk:));
-        MVSwizzleInstance(yapR ?: yapRW, NSSelectorFromString(@"okm_messageForId:inChat:includeRemoved:"),
-                          @selector(mvibe_okm_messageForId:inChat:includeRemoved:));
-
-        // Core Yap — catches Mantle/status writes that skip setters
-        MVSwizzleInstance(yapR ?: yapRW, @selector(objectForKey:inCollection:),
-                          @selector(mvibe_objectForKey:inCollection:));
-        MVSwizzleInstance(yapRW, @selector(setObject:forKey:inCollection:),
-                          @selector(mvibe_setObject:forKey:inCollection:));
-        MVSwizzleInstance(yapRW,
-                          NSSelectorFromString(@"setObject:forKey:inCollection:withMetadata:serializedObject:serializedMetadata:"),
-                          @selector(mvibe_setObject:forKey:inCollection:withMetadata:serializedObject:serializedMetadata:));
-        MVSwizzleInstance(yapRW, @selector(removeObjectForKey:inCollection:),
-                          @selector(mvibe_removeObjectForKey:inCollection:));
-        MVSwizzleInstance(yapRW, @selector(removeObjectsForKeys:inCollection:),
-                          @selector(mvibe_removeObjectsForKeys:inCollection:));
+        MVLogSwizzle(MVSwizzleInstance(yapRW, NSSelectorFromString(@"okm_saveMessage:"),
+                          @selector(mvibe_okm_saveMessage:)), yapRW, @"okm_saveMessage:");
+        // Category methods: class_copyMethodList may miss them — force swizzle without owns check via direct exchange
+        // Re-try with looser helper for categories:
+        if (yapR || yapRW) {
+            Class c = yapR ?: yapRW;
+            Method donor = class_getInstanceMethod([MaxVibeAntiDeleteHooks class], @selector(mvibe_okm_messageForPk:));
+            Method orig = class_getInstanceMethod(c, NSSelectorFromString(@"okm_messageForPk:"));
+            if (donor && orig) {
+                class_addMethod(c, @selector(mvibe_okm_messageForPk:), method_getImplementation(donor), method_getTypeEncoding(orig));
+                method_exchangeImplementations(orig, class_getInstanceMethod(c, @selector(mvibe_okm_messageForPk:)));
+                MVLog(@"swizzle okm_messageForPk: OK");
+            }
+            donor = class_getInstanceMethod([MaxVibeAntiDeleteHooks class], @selector(mvibe_objectForKey:inCollection:));
+            orig = class_getInstanceMethod(c, @selector(objectForKey:inCollection:));
+            if (donor && orig) {
+                class_addMethod(c, @selector(mvibe_objectForKey:inCollection:), method_getImplementation(donor), method_getTypeEncoding(orig));
+                method_exchangeImplementations(orig, class_getInstanceMethod(c, @selector(mvibe_objectForKey:inCollection:)));
+                MVLog(@"swizzle objectForKey:inCollection: OK");
+            }
+        }
+        if (yapRW) {
+            Method donor = class_getInstanceMethod([MaxVibeAntiDeleteHooks class], @selector(mvibe_setObject:forKey:inCollection:));
+            Method orig = class_getInstanceMethod(yapRW, @selector(setObject:forKey:inCollection:));
+            if (donor && orig) {
+                class_addMethod(yapRW, @selector(mvibe_setObject:forKey:inCollection:), method_getImplementation(donor), method_getTypeEncoding(orig));
+                method_exchangeImplementations(orig, class_getInstanceMethod(yapRW, @selector(mvibe_setObject:forKey:inCollection:)));
+                MVLog(@"swizzle setObject:forKey:inCollection: OK");
+            }
+            donor = class_getInstanceMethod([MaxVibeAntiDeleteHooks class], @selector(mvibe_removeObjectsForKeys:inCollection:));
+            orig = class_getInstanceMethod(yapRW, @selector(removeObjectsForKeys:inCollection:));
+            if (donor && orig) {
+                class_addMethod(yapRW, @selector(mvibe_removeObjectsForKeys:inCollection:), method_getImplementation(donor), method_getTypeEncoding(orig));
+                method_exchangeImplementations(orig, class_getInstanceMethod(yapRW, @selector(mvibe_removeObjectsForKeys:inCollection:)));
+                MVLog(@"swizzle removeObjectsForKeys:inCollection: OK");
+            }
+            donor = class_getInstanceMethod([MaxVibeAntiDeleteHooks class], @selector(mvibe_removeObjectForKey:inCollection:));
+            orig = class_getInstanceMethod(yapRW, @selector(removeObjectForKey:inCollection:));
+            if (donor && orig) {
+                class_addMethod(yapRW, @selector(mvibe_removeObjectForKey:inCollection:), method_getImplementation(donor), method_getTypeEncoding(orig));
+                method_exchangeImplementations(orig, class_getInstanceMethod(yapRW, @selector(mvibe_removeObjectForKey:inCollection:)));
+                MVLog(@"swizzle removeObjectForKey:inCollection: OK");
+            }
+            donor = class_getInstanceMethod([MaxVibeAntiDeleteHooks class], @selector(mvibe_okm_saveMessage:));
+            orig = class_getInstanceMethod(yapRW, NSSelectorFromString(@"okm_saveMessage:"));
+            if (donor && orig) {
+                // already attempted via MVSwizzleInstance; ensure once
+            }
+        }
 
         Class msgCls = NSClassFromString(@"OKMMessage");
-        MVSwizzleInstance(msgCls, NSSelectorFromString(@"setStatus:"),
-                          @selector(mvibe_setStatus:));
+        Method donor = class_getInstanceMethod([MaxVibeAntiDeleteHooks class], @selector(mvibe_setStatus:));
+        Method orig = class_getInstanceMethod(msgCls, NSSelectorFromString(@"setStatus:"));
+        if (donor && orig) {
+            class_addMethod(msgCls, @selector(mvibe_setStatus:), method_getImplementation(donor), method_getTypeEncoding(orig));
+            method_exchangeImplementations(orig, class_getInstanceMethod(msgCls, @selector(mvibe_setStatus:)));
+            MVLog(@"swizzle setStatus: OK");
+        } else {
+            MVLog(@"swizzle setStatus: FAIL");
+        }
 
         Class creds = NSClassFromString(@"OKMMessengerCredentials");
-        MVSwizzleInstance(creds, NSSelectorFromString(@"setCurrentUserId:"),
-                          @selector(mvibe_setCurrentUserId:));
+        donor = class_getInstanceMethod([MaxVibeAntiDeleteHooks class], @selector(mvibe_setCurrentUserId:));
+        orig = class_getInstanceMethod(creds, NSSelectorFromString(@"setCurrentUserId:"));
+        if (donor && orig) {
+            class_addMethod(creds, @selector(mvibe_setCurrentUserId:), method_getImplementation(donor), method_getTypeEncoding(orig));
+            method_exchangeImplementations(orig, class_getInstanceMethod(creds, @selector(mvibe_setCurrentUserId:)));
+            MVLog(@"swizzle setCurrentUserId: OK");
+        }
 
         Class chat = NSClassFromString(@"OKMChatService");
-        MVSwizzleInstance(chat, NSSelectorFromString(@"deleteMessagesWithPks:deleteForAll:"),
-                          @selector(mvibe_deleteMessagesWithPks:deleteForAll:));
-        MVSwizzleInstance(chat, NSSelectorFromString(@"_deleteMessagesWithPks:deleteForAll:enqueueTasks:"),
-                          @selector(mvibe__deleteMessagesWithPks:deleteForAll:enqueueTasks:));
-        MVSwizzleInstance(chat, NSSelectorFromString(@"_messagesUpdated:inTransaction:"),
-                          @selector(mvibe_messagesUpdated:inTransaction:));
+        donor = class_getInstanceMethod([MaxVibeAntiDeleteHooks class], @selector(mvibe_deleteMessagesWithPks:deleteForAll:));
+        orig = class_getInstanceMethod(chat, NSSelectorFromString(@"deleteMessagesWithPks:deleteForAll:"));
+        if (donor && orig) {
+            class_addMethod(chat, @selector(mvibe_deleteMessagesWithPks:deleteForAll:), method_getImplementation(donor), method_getTypeEncoding(orig));
+            method_exchangeImplementations(orig, class_getInstanceMethod(chat, @selector(mvibe_deleteMessagesWithPks:deleteForAll:)));
+            MVLog(@"swizzle deleteMessagesWithPks: OK");
+        }
+        donor = class_getInstanceMethod([MaxVibeAntiDeleteHooks class], @selector(mvibe__deleteMessagesWithPks:deleteForAll:enqueueTasks:));
+        orig = class_getInstanceMethod(chat, NSSelectorFromString(@"_deleteMessagesWithPks:deleteForAll:enqueueTasks:"));
+        if (donor && orig) {
+            class_addMethod(chat, @selector(mvibe__deleteMessagesWithPks:deleteForAll:enqueueTasks:), method_getImplementation(donor), method_getTypeEncoding(orig));
+            method_exchangeImplementations(orig, class_getInstanceMethod(chat, @selector(mvibe__deleteMessagesWithPks:deleteForAll:enqueueTasks:)));
+            MVLog(@"swizzle _deleteMessagesWithPks: OK");
+        }
+        donor = class_getInstanceMethod([MaxVibeAntiDeleteHooks class], @selector(mvibe_messagesUpdated:inTransaction:));
+        orig = class_getInstanceMethod(chat, NSSelectorFromString(@"_messagesUpdated:inTransaction:"));
+        if (donor && orig) {
+            class_addMethod(chat, @selector(mvibe_messagesUpdated:inTransaction:), method_getImplementation(donor), method_getTypeEncoding(orig));
+            method_exchangeImplementations(orig, class_getInstanceMethod(chat, @selector(mvibe_messagesUpdated:inTransaction:)));
+            MVLog(@"swizzle _messagesUpdated: OK");
+        }
 
-        // Remote delete entry points — class discovered at runtime
-        MVSwizzleAllClasses(NSSelectorFromString(@"_handleDeletedMessages:inChatWithId:"),
-                            @selector(mvibe_handleDeletedMessages:inChatWithId:),
-                            @"_handleDeletedMessages");
-        MVSwizzleAllClasses(NSSelectorFromString(@"_messagesDeleted:inChat:"),
-                            @selector(mvibe_messagesDeleted:inChat:),
-                            @"_messagesDeleted");
+        // Exact remote-delete classes only (no global scan — it crashed via bad exchanges)
+        Class pushHelper = NSClassFromString(@"OKMPushCleanupHelper");
+        donor = class_getInstanceMethod([MaxVibeAntiDeleteHooks class], @selector(mvibe_handleDeletedMessages:inChatWithId:));
+        orig = class_getInstanceMethod(pushHelper, NSSelectorFromString(@"_handleDeletedMessages:inChatWithId:"));
+        if (donor && orig) {
+            class_addMethod(pushHelper, @selector(mvibe_handleDeletedMessages:inChatWithId:), method_getImplementation(donor), method_getTypeEncoding(orig));
+            method_exchangeImplementations(orig, class_getInstanceMethod(pushHelper, @selector(mvibe_handleDeletedMessages:inChatWithId:)));
+            MVLog(@"swizzle OKMPushCleanupHelper _handleDeletedMessages OK");
+        } else {
+            MVLog(@"swizzle OKMPushCleanupHelper _handleDeletedMessages FAIL orig=%p", orig);
+        }
 
-        MVSwizzleInstance([UILabel class], @selector(setText:), @selector(mvibe_setText:));
-        MVSwizzleInstance([UILabel class], @selector(setAttributedText:), @selector(mvibe_setAttributedText:));
+        Class delListener = NSClassFromString(@"OKMMessageDeleteListener");
+        donor = class_getInstanceMethod([MaxVibeAntiDeleteHooks class], @selector(mvibe_messagesDeleted:inChat:));
+        orig = class_getInstanceMethod(delListener, NSSelectorFromString(@"_messagesDeleted:inChat:"));
+        if (donor && orig) {
+            class_addMethod(delListener, @selector(mvibe_messagesDeleted:inChat:), method_getImplementation(donor), method_getTypeEncoding(orig));
+            method_exchangeImplementations(orig, class_getInstanceMethod(delListener, @selector(mvibe_messagesDeleted:inChat:)));
+            MVLog(@"swizzle OKMMessageDeleteListener _messagesDeleted OK");
+        } else {
+            MVLog(@"swizzle OKMMessageDeleteListener _messagesDeleted FAIL orig=%p", orig);
+        }
+
+        donor = class_getInstanceMethod([MaxVibeAntiDeleteHooks class], @selector(mvibe_setText:));
+        orig = class_getInstanceMethod([UILabel class], @selector(setText:));
+        if (donor && orig) {
+            class_addMethod([UILabel class], @selector(mvibe_setText:), method_getImplementation(donor), method_getTypeEncoding(orig));
+            method_exchangeImplementations(orig, class_getInstanceMethod([UILabel class], @selector(mvibe_setText:)));
+        }
+        donor = class_getInstanceMethod([MaxVibeAntiDeleteHooks class], @selector(mvibe_setAttributedText:));
+        orig = class_getInstanceMethod([UILabel class], @selector(setAttributedText:));
+        if (donor && orig) {
+            class_addMethod([UILabel class], @selector(mvibe_setAttributedText:), method_getImplementation(donor), method_getTypeEncoding(orig));
+            method_exchangeImplementations(orig, class_getInstanceMethod([UILabel class], @selector(mvibe_setAttributedText:)));
+        }
 
         MVLog(@"install done");
     });
