@@ -1,9 +1,10 @@
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
+#import "MaxVibeAntiDelete.h"
 
 /*
- * MaxVibe: Telegram banner + native Settings row + soft persist fix.
+ * MaxVibe: Telegram banner + native Settings row + soft persist fix + anti-delete.
  */
 
 extern void MaxVibeInstallPersistFixes(void);
@@ -118,6 +119,7 @@ static char kMvibeSettingsRowKey;
     if (gDidSchedule) return;
     gDidSchedule = YES;
     MaxVibeInstallPersistFixes();
+    MaxVibeInstallAntiDelete();
     [self installSettingsHooks];
 
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kInitialDelay * NSEC_PER_SEC)),
@@ -404,7 +406,7 @@ static char kMvibeSettingsRowKey;
     title.font = [UIFont systemFontOfSize:24 weight:UIFontWeightBold];
     title.translatesAutoresizingMaskIntoConstraints = NO;
     UILabel *sub = [[UILabel alloc] init];
-    sub.text = @"как на Android · Telegram и баннер"; sub.textColor = [self hex:0x8E858A alpha:1];
+    sub.text = @"как на Android · Telegram, баннер, антиудаление"; sub.textColor = [self hex:0x8E858A alpha:1];
     sub.font = [UIFont systemFontOfSize:12]; sub.translatesAutoresizingMaskIntoConstraints = NO;
 
     UIImageView *hero = [[UIImageView alloc] initWithImage:[self bannerImage]];
@@ -424,6 +426,7 @@ static char kMvibeSettingsRowKey;
 
     [stack addArrangedSubview:[self settingsRowTitle:@"Telegram канал" subtitle:@"t.me/max_vibe" action:@selector(onSettingsTelegram) chevron:YES]];
     [stack addArrangedSubview:[self settingsRowTitle:[self bannerEnabled] ? @"Баннер: включён" : @"Баннер: выключен" subtitle:@"Стартовый баннер раз в сутки" action:@selector(onSettingsToggleBanner) chevron:NO]];
+    [stack addArrangedSubview:[self settingsRowTitle:MaxVibeAntiDeleteEnabled() ? @"Антиудаление: включено" : @"Антиудаление: выключено" subtitle:@"Сохранять входящие, если собеседник удалил · метка deleted" action:@selector(onSettingsToggleAntiDelete) chevron:NO]];
     [stack addArrangedSubview:[self settingsRowTitle:@"Показать баннер сейчас" subtitle:@"Сбросить таймер" action:@selector(onSettingsForceBanner) chevron:YES]];
     [stack addArrangedSubview:[self settingsRowTitle:@"Сменить иконку" subtitle:@"Скоро" action:@selector(onSettingsStub) chevron:YES]];
     [stack addArrangedSubview:[self settingsRowTitle:@"Аккаунты" subtitle:@"Скоро" action:@selector(onSettingsStub) chevron:YES]];
@@ -480,6 +483,10 @@ static char kMvibeSettingsRowKey;
 - (void)onSettingsTelegram { [self openTelegram]; }
 - (void)onSettingsToggleBanner {
     [self setBannerEnabled:![self bannerEnabled]];
+    [self dismissSettings];
+}
+- (void)onSettingsToggleAntiDelete {
+    MaxVibeSetAntiDeleteEnabled(!MaxVibeAntiDeleteEnabled());
     [self dismissSettings];
 }
 - (void)onSettingsForceBanner {
@@ -610,6 +617,7 @@ __attribute__((constructor))
 static void MaxVibeModInit(void) {
     @autoreleasepool {
         MaxVibeInstallPersistFixes();
+        MaxVibeInstallAntiDelete();
         dispatch_async(dispatch_get_main_queue(), ^{
             [[MaxVibeModController shared] start];
         });

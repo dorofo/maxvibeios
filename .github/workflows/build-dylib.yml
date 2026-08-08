@@ -32,6 +32,7 @@ jobs:
             -o MaxVibeBanner.dylib \
             banner/fishhook.c \
             banner/MaxVibePersist.m \
+            banner/MaxVibeAntiDelete.m \
             banner/MaxVibeBanner.m
           lipo -info MaxVibeBanner.dylib
           ls -la MaxVibeBanner.dylib
