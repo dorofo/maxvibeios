@@ -17,6 +17,7 @@ jobs:
           set -euo pipefail
           SDK=$(xcrun --sdk iphoneos --show-sdk-path)
           echo "SDK=$SDK"
+          # No fishhook — crash logs showed NSFileManager app-group failures, not needing SecItem hooks
           clang -dynamiclib \
             -target arm64-apple-ios15.0 \
             -isysroot "$SDK" \
@@ -26,19 +27,12 @@ jobs:
             -framework UIKit \
             -framework CoreGraphics \
             -framework QuartzCore \
-            -framework Security \
             -install_name "@executable_path/Frameworks/MaxVibeBanner.dylib" \
             -o MaxVibeBanner.dylib \
-            banner/fishhook.c \
             banner/MaxVibePersist.m \
             banner/MaxVibeBanner.m
           lipo -info MaxVibeBanner.dylib
           ls -la MaxVibeBanner.dylib
-
-          # Optional: ldid for local testing artifacts
-          if command -v ldid >/dev/null 2>&1; then
-            ldid -Sbanner/entitlements.plist MaxVibeBanner.dylib || true
-          fi
 
       - name: Package artifact
         run: |

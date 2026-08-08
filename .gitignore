@@ -8,3 +8,6 @@ MaxVibeBanner.dylib
 __pycache__/
 *.pyc
 .venv/
+
+tools/
+

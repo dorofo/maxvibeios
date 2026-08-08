@@ -2,7 +2,7 @@
 """Inject MaxVibeBanner.dylib into a decrypted MAX.app / IPA (Windows-friendly).
 
 Uses in-place Mach-O load-command insertion (does NOT rewrite the binary with LIEF).
-LIEF rebuild shrinks/breaks code-signature entitlements and causes session/keychain loss.
+Optionally signs with ldid + entitlements for TrollStore keychain/app-groups.
 """
 
 from __future__ import annotations
@@ -10,7 +10,7 @@ from __future__ import annotations
 import argparse
 import shutil
 import struct
-import sys
+import subprocess
 import zipfile
 from pathlib import Path
 
@@ -21,7 +21,6 @@ LOAD_PATH = "@executable_path/Frameworks/MaxVibeBanner.dylib"
 MH_MAGIC_64 = 0xFEEDFACF
 LC_SEGMENT_64 = 0x19
 LC_LOAD_DYLIB = 0x0C
-LC_CODE_SIGNATURE = 0x1D
 
 
 def find_app(payload: Path) -> Path:
@@ -36,7 +35,6 @@ def _align8(n: int) -> int:
 
 
 def _min_section_offset(data: bytearray, ncmds: int) -> int | None:
-    """Lowest non-zero section file offset in any LC_SEGMENT_64 (usually __text)."""
     off = 32
     min_off = None
     for _ in range(ncmds):
@@ -62,12 +60,11 @@ def inject_macho_inplace(binary_path: Path, load_path: str = LOAD_PATH) -> None:
 
     magic = struct.unpack_from("<I", data, 0)[0]
     if magic != MH_MAGIC_64:
-        raise SystemExit(f"unsupported macho magic: {hex(magic)} (need arm64 MH_MAGIC_64)")
+        raise SystemExit(f"unsupported macho magic: {hex(magic)}")
 
     ncmds, sizeofcmds = struct.unpack_from("<II", data, 16)
     header_end = 32 + sizeofcmds
 
-    # Already injected?
     off = 32
     for _ in range(ncmds):
         cmd, cmdsize = struct.unpack_from("<II", data, off)
@@ -81,7 +78,6 @@ def inject_macho_inplace(binary_path: Path, load_path: str = LOAD_PATH) -> None:
         off += cmdsize
 
     path_bytes = load_path.encode("utf-8") + b"\x00"
-    # cmd + cmdsize + name_offset + timestamp + current_version + compat_version + path
     cmdsize = _align8(24 + len(path_bytes))
     pad = cmdsize - (24 + len(path_bytes))
 
@@ -91,35 +87,25 @@ def inject_macho_inplace(binary_path: Path, load_path: str = LOAD_PATH) -> None:
     slack = min_sect - header_end
     print(f"header_end={header_end} first_section={min_sect} slack={slack} need={cmdsize}")
     if slack < cmdsize:
-        raise SystemExit(
-            f"not enough header slack for in-place inject ({slack} < {cmdsize}); "
-            "refusing LIEF rewrite (breaks keychain/session)"
-        )
+        raise SystemExit(f"not enough header slack ({slack} < {cmdsize})")
 
-    # Ensure slack is zeroed / unused
-    # Build command
     name_offset = 24
     cmd = bytearray()
     cmd += struct.pack("<II", LC_LOAD_DYLIB, cmdsize)
-    cmd += struct.pack("<IIII", name_offset, 2, 0x10000, 0x10000)  # timestamp=2, versions like insert_dylib
+    cmd += struct.pack("<IIII", name_offset, 2, 0x10000, 0x10000)
     cmd += path_bytes
     cmd += b"\x00" * pad
     assert len(cmd) == cmdsize
 
-    # Write into slack (must currently be unused padding)
     data[header_end : header_end + cmdsize] = cmd
     struct.pack_into("<I", data, 16, ncmds + 1)
     struct.pack_into("<I", data, 20, sizeofcmds + cmdsize)
-
     binary_path.write_bytes(data)
     print(f"In-place injected LC_LOAD_DYLIB ({cmdsize} bytes): {load_path}")
-    print(f"Wrote patched binary (size unchanged): {binary_path} ({len(data)} bytes)")
 
 
 def restore_executable_from_ipa(app: Path, source_ipa: Path, exe_name: str) -> None:
-    """Replace executable with pristine copy from decrypted IPA (keeps Info.plist/icons)."""
     with zipfile.ZipFile(source_ipa, "r") as zf:
-        # Find matching executable path
         candidates = [
             n for n in zf.namelist()
             if n.endswith(f".app/{exe_name}") and n.startswith("Payload/")
@@ -127,8 +113,7 @@ def restore_executable_from_ipa(app: Path, source_ipa: Path, exe_name: str) -> N
         if not candidates:
             raise SystemExit(f"executable {exe_name} not found inside {source_ipa}")
         raw = zf.read(candidates[0])
-    dest = app / exe_name
-    dest.write_bytes(raw)
+    (app / exe_name).write_bytes(raw)
     print(f"Restored {exe_name} from {source_ipa.name} ({len(raw)} bytes)")
 
 
@@ -150,7 +135,6 @@ def pack_ipa(payload_parent: Path, out_ipa: Path) -> None:
     with zipfile.ZipFile(out_ipa, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         for path in payload.rglob("*"):
             if path.is_file():
-                # skip accidental backups
                 if path.name.endswith(".bak_pre_banner") or path.name.endswith(".tmp"):
                     continue
                 arc = path.relative_to(payload_parent).as_posix()
@@ -158,19 +142,35 @@ def pack_ipa(payload_parent: Path, out_ipa: Path) -> None:
     print(f"Packed IPA: {out_ipa} ({out_ipa.stat().st_size} bytes)")
 
 
+def ldid_sign(path: Path, entitlements: Path, ldid: Path | None = None) -> None:
+    candidates = []
+    if ldid:
+        candidates.append(Path(ldid))
+    candidates.append(Path(__file__).resolve().parents[1] / "tools" / "ldid.exe")
+    which = shutil.which("ldid")
+    exe = next((str(c) for c in candidates if c.is_file()), None)
+    if not exe and which:
+        exe = which
+    if not exe:
+        print("WARNING: ldid not found — skip entitlements sign")
+        return
+    cmd = [exe, f"-S{entitlements}", str(path)]
+    print("Running:", " ".join(cmd))
+    subprocess.check_call(cmd)
+    print(f"Signed {path.name} with {entitlements.name}")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Inject MaxVibe Telegram banner dylib into IPA/app")
-    ap.add_argument("--app", type=Path, help="Path to MAX.app")
-    ap.add_argument("--payload-dir", type=Path, help="Directory containing Payload/ (e.g. temp)")
-    ap.add_argument("--dylib", type=Path, required=True, help="MaxVibeBanner.dylib")
-    ap.add_argument("--png", type=Path, help="banner_character.png (default: next to dylib or banner/)")
-    ap.add_argument("--out-ipa", type=Path, help="Output IPA path")
-    ap.add_argument(
-        "--restore-from-ipa",
-        type=Path,
-        help="Restore pristine executable from this decrypted IPA before inject "
-             "(recommended after a previous LIEF inject)",
-    )
+    ap.add_argument("--app", type=Path)
+    ap.add_argument("--payload-dir", type=Path)
+    ap.add_argument("--dylib", type=Path, required=True)
+    ap.add_argument("--png", type=Path)
+    ap.add_argument("--out-ipa", type=Path)
+    ap.add_argument("--restore-from-ipa", type=Path)
+    ap.add_argument("--entitlements", type=Path)
+    ap.add_argument("--ldid", type=Path)
+    ap.add_argument("--no-sign", action="store_true")
     args = ap.parse_args()
 
     dylib = args.dylib.resolve()
@@ -190,20 +190,15 @@ def main() -> None:
     if args.app:
         app = args.app.resolve()
     elif args.payload_dir:
-        app = find_app((args.payload_dir.resolve() / "Payload"))
+        app = find_app(args.payload_dir.resolve() / "Payload")
     else:
         raise SystemExit("Pass --app or --payload-dir")
-
-    if not app.is_dir():
-        raise SystemExit(f"app not found: {app}")
 
     exe_name = "MAX"
     try:
         import plistlib
-
         with open(app / "Info.plist", "rb") as f:
-            info = plistlib.load(f)
-        exe_name = info.get("CFBundleExecutable", exe_name)
+            exe_name = plistlib.load(f).get("CFBundleExecutable", exe_name)
     except Exception:
         pass
 
@@ -216,6 +211,20 @@ def main() -> None:
 
     copy_payload_files(app, dylib, png)
     inject_macho_inplace(binary)
+
+    ents = args.entitlements
+    if ents is None:
+        for cand in (
+            Path(__file__).resolve().parents[1] / "banner" / "entitlements.plist",
+            dylib.parent / "entitlements.plist",
+        ):
+            if cand.is_file():
+                ents = cand
+                break
+    if not args.no_sign and ents and Path(ents).is_file():
+        e = Path(ents).resolve()
+        ldid_sign(binary, e, args.ldid)
+        ldid_sign(app / "Frameworks" / DYLIB_NAME, e, args.ldid)
 
     if args.out_ipa:
         parent = app.parent.parent

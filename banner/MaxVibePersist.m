@@ -1,52 +1,65 @@
 #import <Foundation/Foundation.h>
-#import <Security/Security.h>
 #import <objc/runtime.h>
-#import <mach-o/dyld.h>
-#import "fishhook.h"
 
 /*
- * Session persist: rebind SecItem ONLY in main image.
- * Only CopyMatching + Add (Update/Delete hooks were extra crash surface).
+ * SAFE persist (no fishhook):
+ * Crash logs showed SIGABRT from NSFileManager contentsOfDirectoryAtURL —
+ * typical when group.ru.oneme.app container URL is nil/unusable under TrollStore.
+ * Redirect App Group container + UserDefaults suite into Library/mvibe_group/.
  */
 
-static OSStatus (*orig_SecItemCopyMatching)(CFDictionaryRef, CFTypeRef *) = NULL;
-static OSStatus (*orig_SecItemAdd)(CFDictionaryRef, CFTypeRef *) = NULL;
-
-static CFMutableDictionaryRef MVStripAccessGroup(CFDictionaryRef dict) {
-    if (!dict) return NULL;
-    if (CFGetTypeID(dict) != CFDictionaryGetTypeID()) return NULL;
-    CFMutableDictionaryRef m = CFDictionaryCreateMutableCopy(kCFAllocatorDefault, 0, dict);
-    if (!m) return NULL;
-    CFDictionaryRemoveValue(m, kSecAttrAccessGroup);
-    return m;
+static NSURL *MVLocalGroupContainer(NSString *groupIdentifier) {
+    NSString *lib = NSSearchPathForDirectoriesInDomains(NSLibraryDirectory, NSUserDomainMask, YES).firstObject;
+    if (!lib) lib = NSTemporaryDirectory();
+    NSString *safe = [[groupIdentifier ?: @"group.unknown"]
+                      stringByReplacingOccurrencesOfString:@"/" withString:@"_"];
+    NSString *path = [[lib stringByAppendingPathComponent:@"mvibe_group"]
+                      stringByAppendingPathComponent:safe];
+    NSError *err = nil;
+    [[NSFileManager defaultManager] createDirectoryAtPath:path
+                              withIntermediateDirectories:YES
+                                               attributes:nil
+                                                    error:&err];
+    return [NSURL fileURLWithPath:path isDirectory:YES];
 }
 
-static OSStatus mv_SecItemCopyMatching(CFDictionaryRef query, CFTypeRef *result) {
-    if (!orig_SecItemCopyMatching) return errSecParam;
-    OSStatus st = orig_SecItemCopyMatching(query, result);
-    if (st == errSecSuccess) return st;
-    CFMutableDictionaryRef stripped = MVStripAccessGroup(query);
-    if (!stripped) return st;
-    OSStatus st2 = orig_SecItemCopyMatching(stripped, result);
-    CFRelease(stripped);
-    return st2;
+static BOOL MVIsOnemeGroup(NSString *groupIdentifier) {
+    if (![groupIdentifier isKindOfClass:[NSString class]]) return NO;
+    return [groupIdentifier isEqualToString:@"group.ru.oneme.app"] ||
+           [groupIdentifier hasPrefix:@"group.ru.oneme."];
 }
 
-static OSStatus mv_SecItemAdd(CFDictionaryRef attributes, CFTypeRef *result) {
-    if (!orig_SecItemAdd) return errSecParam;
-    CFMutableDictionaryRef stripped = MVStripAccessGroup(attributes);
-    if (stripped) {
-        OSStatus st = orig_SecItemAdd(stripped, result);
-        CFRelease(stripped);
-        if (st == errSecSuccess || st == errSecDuplicateItem) return st;
+@implementation NSFileManager (MaxVibePersist)
+
+- (NSURL *)mvibe_containerURLForSecurityApplicationGroupIdentifier:(NSString *)groupIdentifier {
+    if (MVIsOnemeGroup(groupIdentifier)) {
+        return MVLocalGroupContainer(groupIdentifier);
     }
-    return orig_SecItemAdd(attributes, result);
+    NSURL *url = [self mvibe_containerURLForSecurityApplicationGroupIdentifier:groupIdentifier];
+    if (!url && groupIdentifier.length) {
+        // Any missing group container → local fallback (prevents contentsOfDirectory crash)
+        return MVLocalGroupContainer(groupIdentifier);
+    }
+    return url;
 }
+
++ (void)mvibeInstallContainerRedirect {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        Class cls = [NSFileManager class];
+        SEL orig = @selector(containerURLForSecurityApplicationGroupIdentifier:);
+        SEL swiz = @selector(mvibe_containerURLForSecurityApplicationGroupIdentifier:);
+        Method mOrig = class_getInstanceMethod(cls, orig);
+        Method mSwiz = class_getInstanceMethod(cls, swiz);
+        if (mOrig && mSwiz) method_exchangeImplementations(mOrig, mSwiz);
+    });
+}
+
+@end
 
 static NSString *MVRedirectSuiteName(NSString *suiteName) {
     if (![suiteName isKindOfClass:[NSString class]] || suiteName.length == 0) return suiteName;
-    if ([suiteName isEqualToString:@"group.ru.oneme.app"] ||
-        [suiteName hasPrefix:@"group.ru.oneme."]) {
+    if (MVIsOnemeGroup(suiteName)) {
         return @"mvibe.local.group.ru.oneme.app";
     }
     return suiteName;
@@ -69,22 +82,10 @@ static NSString *MVRedirectSuiteName(NSString *suiteName) {
 
 @end
 
-static void MVRebindMainImageOnly(void) {
-    if (_dyld_image_count() == 0) return;
-    const struct mach_header *hdr = _dyld_get_image_header(0);
-    intptr_t slide = _dyld_get_image_vmaddr_slide(0);
-    if (!hdr) return;
-    struct rebinding rebs[] = {
-        {"SecItemCopyMatching", (void *)mv_SecItemCopyMatching, (void **)&orig_SecItemCopyMatching},
-        {"SecItemAdd", (void *)mv_SecItemAdd, (void **)&orig_SecItemAdd},
-    };
-    rebind_symbols_image((void *)hdr, slide, rebs, sizeof(rebs) / sizeof(rebs[0]));
-}
-
 void MaxVibeInstallPersistFixes(void) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
+        [NSFileManager mvibeInstallContainerRedirect];
         [NSUserDefaults mvibeInstallSuiteRedirect];
-        MVRebindMainImageOnly();
     });
 }
