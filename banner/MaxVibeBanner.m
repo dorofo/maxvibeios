@@ -426,7 +426,7 @@ static char kMvibeSettingsRowKey;
 
     [stack addArrangedSubview:[self settingsRowTitle:@"Telegram канал" subtitle:@"t.me/max_vibe" action:@selector(onSettingsTelegram) chevron:YES]];
     [stack addArrangedSubview:[self settingsRowTitle:[self bannerEnabled] ? @"Баннер: включён" : @"Баннер: выключен" subtitle:@"Стартовый баннер раз в сутки" action:@selector(onSettingsToggleBanner) chevron:NO]];
-    [stack addArrangedSubview:[self settingsRowTitle:MaxVibeAntiDeleteEnabled() ? @"Антиудаление: включено" : @"Антиудаление: выключено" subtitle:@"Вместо удаления — update с ❌ в начале текста" action:@selector(onSettingsToggleAntiDelete) chevron:NO]];
+    [stack addArrangedSubview:[self settingsRowTitle:@"Антиудаление: временно выкл." subtitle:@"Хуки отключены — чиним краш при входе" action:@selector(onSettingsStub) chevron:NO]];
     [stack addArrangedSubview:[self settingsRowTitle:@"Показать баннер сейчас" subtitle:@"Сбросить таймер" action:@selector(onSettingsForceBanner) chevron:YES]];
     [stack addArrangedSubview:[self settingsRowTitle:@"Сменить иконку" subtitle:@"Скоро" action:@selector(onSettingsStub) chevron:YES]];
     [stack addArrangedSubview:[self settingsRowTitle:@"Аккаунты" subtitle:@"Скоро" action:@selector(onSettingsStub) chevron:YES]];
