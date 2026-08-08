@@ -11,8 +11,8 @@
 static NSURL *MVLocalGroupContainer(NSString *groupIdentifier) {
     NSString *lib = NSSearchPathForDirectoriesInDomains(NSLibraryDirectory, NSUserDomainMask, YES).firstObject;
     if (!lib) lib = NSTemporaryDirectory();
-    NSString *safe = [[groupIdentifier ?: @"group.unknown"]
-                      stringByReplacingOccurrencesOfString:@"/" withString:@"_"];
+    NSString *gid = groupIdentifier.length ? groupIdentifier : @"group.unknown";
+    NSString *safe = [gid stringByReplacingOccurrencesOfString:@"/" withString:@"_"];
     NSString *path = [[lib stringByAppendingPathComponent:@"mvibe_group"]
                       stringByAppendingPathComponent:safe];
     NSError *err = nil;
