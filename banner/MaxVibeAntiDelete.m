@@ -4,28 +4,21 @@
 #import <stdarg.h>
 
 /*
- * Anti-delete v6
- *
- * Logs (v5): own "delete for all" → keep=0 allow=1 → SIGSEGV.
- * Cause: ChatService deleteMessages* IMP trampolines (even pass-through).
- *
- * Fix:
- *  - Do NOT hook OKMChatService deletes at all (own delete stays vanilla).
- *  - Hook only OKMPushCleanupHelper _handleDeletedMessages + MessageDeleteListener.
- *  - Incoming → tag "❌ "+\ndeletel, async okm_saveMessage: (UPDATE), skip remove.
- *  - Discover Yap write connection by walking KVC from the helper / chatting client,
- *    or by opening yapdb.sqlite as a last resort.
+ * Anti-delete v6:
+ * - No OKMChatService delete hooks (v5 SIGSEGV on own delete-for-all).
+ * - Hook only PushCleanup + MessageDeleteListener.
+ * - Incoming delete -> tag text, async okm_saveMessage (UPDATE), skip remove.
  */
 
 static NSString * const kPrefKey = @"mvibe_anti_delete_enabled";
 static NSString * const kDeletedPksKey = @"mvibe_anti_delete_pks";
 static NSString * const kMyUserIdKey = @"mvibe_anti_delete_my_uid";
-static NSString * const kPrefix = @"❌ ";
+static NSString * const kPrefix = @"\u274C "; /* red cross emoji */
 static NSString * const kDbMarker = @"\ndeletel";
 
 static NSNumber *gMyUserId = nil;
 static NSMutableSet *gDeletedPks = nil;
-static __strong id gWriteConnection = nil; // YapDatabaseConnection
+static id gWriteConnection = nil;
 
 static IMP gOrigSetUserId = NULL;
 static IMP gOrigHandleDeleted = NULL;
@@ -155,7 +148,7 @@ static NSString *MVStripMarkers(NSString *text) {
     if (![text isKindOfClass:[NSString class]]) return text ?: @"";
     NSString *s = text;
     if ([s hasPrefix:kPrefix]) s = [s substringFromIndex:kPrefix.length];
-    for (NSString *m in @[kDbMarker, @"\ndeleted", @"\nудалено"]) {
+    for (NSString *m in @[kDbMarker, @"\ndeleted", @"\n\u0443\u0434\u0430\u043b\u0435\u043d\u043e"]) {
         s = [s stringByReplacingOccurrencesOfString:m withString:@""];
     }
     while ([s hasSuffix:@"\n"]) s = [s substringToIndex:s.length - 1];
@@ -173,7 +166,7 @@ static void MVTagMessageText(id msg) {
     }
 }
 
-#pragma mark - Yap connection discovery
+#pragma mark - Yap connection
 
 static BOOL MVLooksLikeWriteConnection(id obj) {
     if (!obj) return NO;
@@ -183,10 +176,7 @@ static BOOL MVLooksLikeWriteConnection(id obj) {
 
 static void MVRememberConnection(id conn) {
     if (!MVLooksLikeWriteConnection(conn)) return;
-    if (gWriteConnection != conn) {
-        gWriteConnection = conn; // strong
-        MVLog(@"got write connection %s", object_getClassName(conn));
-    }
+    gWriteConnection = conn;
 }
 
 static id MVKVC(id obj, NSString *key) {
@@ -198,35 +188,33 @@ static id MVFindConnectionFromSeed(id seed) {
     if (MVLooksLikeWriteConnection(gWriteConnection)) return gWriteConnection;
     if (!seed) return nil;
 
-    static NSArray *connKeys;
-    static NSArray *nextKeys;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        connKeys = @[
-            @"dbWriteConnection", @"_dbWriteConnection", @"writeConnection", @"_writeConnection",
-            @"rwConnection", @"_rwConnection", @"yapDatabaseConnection", @"connection"
-        ];
-        nextKeys = @[
-            @"chatService", @"_chatService", @"messengerClient", @"_messengerClient", @"client",
-            @"dependencies", @"_dependencies", @"database", @"_database", @"yapDatabase",
-            @"_yapDatabase", @"db", @"messengerCredentials", @"_messengerCredentials"
-        ];
-    });
+    NSArray *connKeys = @[
+        @"dbWriteConnection", @"_dbWriteConnection", @"writeConnection", @"_writeConnection",
+        @"rwConnection", @"_rwConnection", @"yapDatabaseConnection", @"connection"
+    ];
+    NSArray *nextKeys = @[
+        @"chatService", @"_chatService", @"messengerClient", @"_messengerClient", @"client",
+        @"dependencies", @"_dependencies", @"database", @"_database", @"yapDatabase",
+        @"_yapDatabase", @"db", @"messengerCredentials", @"_messengerCredentials"
+    ];
 
     NSMutableArray *queue = [NSMutableArray arrayWithObject:seed];
-    NSHashTable *seen = [NSHashTable hashTableWithOptions:NSPointerFunctionsWeakMemory];
+    NSMutableSet *seenPtrs = [NSMutableSet set];
     NSUInteger steps = 0;
-    while (queue.count && steps < 40) {
-        id obj = queue.firstObject;
+    while (queue.count > 0 && steps < 40) {
+        id obj = queue[0];
         [queue removeObjectAtIndex:0];
-        if (!obj || [seen containsObject:obj]) continue;
-        [seen addObject:obj];
+        if (!obj) continue;
+        NSValue *ptr = [NSValue valueWithPointer:(__bridge const void *)obj];
+        if ([seenPtrs containsObject:ptr]) continue;
+        [seenPtrs addObject:ptr];
         steps++;
 
         for (NSString *k in connKeys) {
             id c = MVKVC(obj, k);
             if (MVLooksLikeWriteConnection(c)) {
                 MVRememberConnection(c);
+                MVLog(@"got write connection via %@", k);
                 return c;
             }
         }
@@ -241,19 +229,21 @@ static id MVFindConnectionFromSeed(id seed) {
 #pragma clang diagnostic pop
                 if (MVLooksLikeWriteConnection(c)) {
                     MVRememberConnection(c);
+                    MVLog(@"got write connection via newConnection");
                     return c;
                 }
             }
         }
         for (NSString *k in nextKeys) {
             id n = MVKVC(obj, k);
-            if (n && ![seen containsObject:n]) [queue addObject:n];
+            if (!n) continue;
+            NSValue *np = [NSValue valueWithPointer:(__bridge const void *)n];
+            if (![seenPtrs containsObject:np]) [queue addObject:n];
         }
     }
     return nil;
 }
 
-/** Last resort: open Library/**/yapdb.sqlite via YapDatabase. */
 static id MVOpenYapdbFallback(void) {
     if (MVLooksLikeWriteConnection(gWriteConnection)) return gWriteConnection;
     Class YapDatabase = NSClassFromString(@"YapDatabase");
@@ -261,10 +251,10 @@ static id MVOpenYapdbFallback(void) {
 
     NSString *lib = NSSearchPathForDirectoriesInDomains(NSLibraryDirectory, NSUserDomainMask, YES).firstObject;
     if (!lib.length) return nil;
-    NSFileManager *fm = [NSFileManager defaultManager];
-    NSDirectoryEnumerator *en = [fm enumeratorAtPath:lib];
-    NSString *rel = nil;
+
     NSString *found = nil;
+    NSDirectoryEnumerator *en = [[NSFileManager defaultManager] enumeratorAtPath:lib];
+    NSString *rel = nil;
     while ((rel = [en nextObject])) {
         if ([rel.lastPathComponent isEqualToString:@"yapdb.sqlite"]) {
             found = [lib stringByAppendingPathComponent:rel];
@@ -272,13 +262,14 @@ static id MVOpenYapdbFallback(void) {
         }
     }
     if (!found.length) {
-        MVLog(@"yapdb.sqlite not found under Library");
+        MVLog(@"yapdb.sqlite not found");
         return nil;
     }
+
     @try {
         NSURL *url = [NSURL fileURLWithPath:found];
-        id db = ((id (*)(id, SEL, id, id))objc_msgSend)([YapDatabase alloc],
-                        NSSelectorFromString(@"initWithURL:options:"), url, nil);
+        SEL initSel = NSSelectorFromString(@"initWithURL:options:");
+        id db = ((id (*)(id, SEL, id, id))objc_msgSend)([YapDatabase alloc], initSel, url, nil);
         if (!db) return nil;
         SEL newConn = NSSelectorFromString(@"newConnection");
         if (![db respondsToSelector:newConn]) return nil;
@@ -287,7 +278,7 @@ static id MVOpenYapdbFallback(void) {
         id c = [db performSelector:newConn];
 #pragma clang diagnostic pop
         MVRememberConnection(c);
-        MVLog(@"opened fallback yapdb %@", found);
+        MVLog(@"opened fallback yapdb");
         return c;
     } @catch (NSException *ex) {
         MVLog(@"fallback yap open fail: %@", ex.name);
@@ -319,7 +310,7 @@ static void MVAsyncSaveMessage(id seed, id msg) {
                         ((void (*)(id, SEL, id))objc_msgSend)(tx, save, retainedMsg);
                         MVLog(@"UPDATE ok pk=%@", MVPkOfMessage(retainedMsg));
                     } else {
-                        MVLog(@"UPDATE skip: no okm_saveMessage:");
+                        MVLog(@"UPDATE skip: no okm_saveMessage");
                     }
                 } @catch (NSException *ex) {
                     MVLog(@"UPDATE fail: %@", ex.name);
@@ -339,16 +330,15 @@ static void MVAsyncSaveMessage(id seed, id msg) {
 }
 
 static void MVConvertDeleteToUpdate(id seed, id msg) {
-    NSNumber *sid = MVSenderIdOfMessage(msg);
     MVLog(@"candidate pk=%@ sender=%@ my=%@ incoming=%d",
-          MVPkOfMessage(msg), sid, gMyUserId, MVMessageIsIncoming(msg));
+          MVPkOfMessage(msg), MVSenderIdOfMessage(msg), gMyUserId, MVMessageIsIncoming(msg));
     if (!MVMessageIsIncoming(msg)) return;
     MVTagMessageText(msg);
-    MVLog(@"DELETE→UPDATE pk=%@", MVPkOfMessage(msg));
+    MVLog(@"DELETE->UPDATE pk=%@", MVPkOfMessage(msg));
     MVAsyncSaveMessage(seed, msg);
 }
 
-#pragma mark - Hooks (block IMPs — no ChatService)
+#pragma mark - Hooks
 
 static void mvibe_setCurrentUserId(id self, SEL _cmd, NSNumber *uid) {
     MVRememberMyUserId(uid);
@@ -357,7 +347,6 @@ static void mvibe_setCurrentUserId(id self, SEL _cmd, NSNumber *uid) {
 
 static void mvibe_handleDeletedMessages(id self, SEL _cmd, id messages, id chatId) {
     MVEnsureStore();
-    // Always try to learn a DB connection from the cleanup helper graph.
     MVResolveWriteConnection(self);
 
     if (!MaxVibeAntiDeleteEnabled() || !gOrigHandleDeleted) {
@@ -386,7 +375,6 @@ static void mvibe_handleDeletedMessages(id self, SEL _cmd, id messages, id chatI
     MVLog(@"handleDeletedMessages chat=%@ keep=%lu allow=%lu my=%@",
           chatId, (unsigned long)kept, (unsigned long)allow.count, gMyUserId);
 
-    // Own / unknown → vanilla path with ORIGINAL array when unchanged.
     if (allow.count == 0) return;
     if (allow.count == list.count) {
         ((void (*)(id, SEL, id, id))gOrigHandleDeleted)(self, _cmd, messages, chatId);
@@ -439,8 +427,7 @@ void MaxVibeInstallAntiDelete(void) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         MVEnsureStore();
-        MVLog(@"install begin v6 (no ChatService hooks; DELETE→UPDATE) enabled=%d",
-              MaxVibeAntiDeleteEnabled());
+        MVLog(@"install begin v6 (no ChatService hooks) enabled=%d", MaxVibeAntiDeleteEnabled());
 
         Class creds = NSClassFromString(@"OKMMessengerCredentials");
         MVLog(@"setCurrentUserId: %s",
