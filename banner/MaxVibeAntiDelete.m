@@ -39,6 +39,9 @@ static IMP gOrigSetUserId = NULL;
 static IMP gOrigHandleDeleted = NULL;
 static IMP gOrigMessagesDeleted = NULL;
 static IMP gOrigSaveMessage = NULL;
+static IMP gOrigMsgMessageText = NULL;
+static IMP gOrigMsgText = NULL;
+static IMP gOrigMsgTextContent = NULL;
 static SEL gSelHandleDeleted;
 static SEL gSelMessagesDeleted;
 static SEL gSelSaveMessage;
@@ -309,6 +312,35 @@ static void MVTagMessageText(id msg) {
     }
 }
 
+static NSString *MVVisibleTaggedString(NSString *text) {
+    NSString *base = MVStripMarkers(text ?: @"");
+    return [base hasPrefix:kPrefix] ? base : [kPrefix stringByAppendingString:base];
+}
+
+static BOOL MVShouldRenderTagged(id msg) {
+    NSString *pk = MVPkOfMessage(msg);
+    if (pk.length && [gDeletedPks containsObject:pk]) return YES;
+    NSString *text = MVPlainTextOfMessage(msg) ?: @"";
+    return [text containsString:kDbMarker] || [text hasPrefix:kPrefix];
+}
+
+static id MVRenderTaggedValue(id msg, id originalValue) {
+    if (!MVShouldRenderTagged(msg)) return originalValue;
+    if ([originalValue isKindOfClass:[NSString class]]) {
+        return MVVisibleTaggedString((NSString *)originalValue);
+    }
+    NSString *plain = MVPlainTextOfMessage(msg);
+    if (!plain.length && [originalValue respondsToSelector:@selector(valueForKey:)]) {
+        @try {
+            id t = [originalValue valueForKey:@"text"];
+            if ([t isKindOfClass:[NSString class]]) plain = t;
+        } @catch (__unused NSException *ex) {}
+    }
+    plain = MVVisibleTaggedString(plain ?: @"");
+    id neu = MVMakeMessageText(plain);
+    return neu ?: originalValue;
+}
+
 static void MVConvertIncomingDelete(id msg) {
     NSInteger st = MVStatusOfMessage(msg);
     if (MVIsRemovedStatus(st)) gRemovedStatus = st;
@@ -529,6 +561,21 @@ static void mvibe_saveMessage(id self, SEL _cmd, id msg) {
     if (MaxVibeAntiDeleteEnabled()) MVCacheLiveMessage(msg);
 }
 
+static id mvibe_messageText(id self, SEL _cmd) {
+    id orig = gOrigMsgMessageText ? ((id (*)(id, SEL))gOrigMsgMessageText)(self, _cmd) : nil;
+    return MVRenderTaggedValue(self, orig);
+}
+
+static id mvibe_text(id self, SEL _cmd) {
+    id orig = gOrigMsgText ? ((id (*)(id, SEL))gOrigMsgText)(self, _cmd) : nil;
+    return MVRenderTaggedValue(self, orig);
+}
+
+static id mvibe_textContent(id self, SEL _cmd) {
+    id orig = gOrigMsgTextContent ? ((id (*)(id, SEL))gOrigMsgTextContent)(self, _cmd) : nil;
+    return MVRenderTaggedValue(self, orig);
+}
+
 static void mvibe_handleDeletedMessages(id self, SEL _cmd, id messages, id chatId) {
     MVEnsureStore();
     if (!MaxVibeAntiDeleteEnabled() || !gOrigHandleDeleted) {
@@ -639,6 +686,26 @@ void MaxVibeInstallAntiDelete(void) {
             MVLog(@"_handleDeletedMessages: OK");
         } else {
             MVLog(@"_handleDeletedMessages: FAIL");
+        }
+
+        Class msg = NSClassFromString(@"OKMMessage");
+        Method mMsgText = class_getInstanceMethod(msg, NSSelectorFromString(@"messageText"));
+        if (mMsgText) {
+            gOrigMsgMessageText = method_getImplementation(mMsgText);
+            method_setImplementation(mMsgText, (IMP)mvibe_messageText);
+            MVLog(@"OKMMessage messageText: OK");
+        }
+        Method mText = class_getInstanceMethod(msg, NSSelectorFromString(@"text"));
+        if (mText) {
+            gOrigMsgText = method_getImplementation(mText);
+            method_setImplementation(mText, (IMP)mvibe_text);
+            MVLog(@"OKMMessage text: OK");
+        }
+        Method mTextContent = class_getInstanceMethod(msg, NSSelectorFromString(@"textContent"));
+        if (mTextContent) {
+            gOrigMsgTextContent = method_getImplementation(mTextContent);
+            method_setImplementation(mTextContent, (IMP)mvibe_textContent);
+            MVLog(@"OKMMessage textContent: OK");
         }
 
         MVLog(@"install done my=%@", gMyUserId);
