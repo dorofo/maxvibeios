@@ -242,8 +242,11 @@ static BOOL MVSetPlainText(id msg, NSString *text) {
         if (neu) {
             [msg setValue:neu forKey:@"text"];
             @try {
-                if (class_getProperty(object_getClass(msg), "messageText"))
-                    [msg setValue:neu forKey:@"messageText"];
+                if ([msg respondsToSelector:NSSelectorFromString(@"setMessageText:")]) {
+                    ((void (*)(id, SEL, id))objc_msgSend)(msg, NSSelectorFromString(@"setMessageText:"), text);
+                } else if (class_getProperty(object_getClass(msg), "messageText")) {
+                    [msg setValue:text forKey:@"messageText"];
+                }
             } @catch (__unused NSException *ex) {}
             NSString *check = MVPlainTextOfMessage(msg) ?: @"";
             BOOL ok = [check isEqualToString:text] || [check hasPrefix:kPrefix];

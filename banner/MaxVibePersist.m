@@ -148,6 +148,8 @@ static NSString *MVRedirectSuiteName(NSString *suiteName) {
 
 static OSStatus (*orig_SecItemCopyMatching)(CFDictionaryRef, CFTypeRef *) = NULL;
 static OSStatus (*orig_SecItemAdd)(CFDictionaryRef, CFTypeRef *) = NULL;
+static OSStatus (*orig_SecItemUpdate)(CFDictionaryRef, CFDictionaryRef) = NULL;
+static OSStatus (*orig_SecItemDelete)(CFDictionaryRef) = NULL;
 
 static CFMutableDictionaryRef MVStripAccessGroup(CFDictionaryRef dict) {
     if (!dict) return NULL;
@@ -180,6 +182,30 @@ static OSStatus mv_SecItemAdd(CFDictionaryRef attributes, CFTypeRef *result) {
     return orig_SecItemAdd(attributes, result);
 }
 
+static OSStatus mv_SecItemUpdate(CFDictionaryRef query, CFDictionaryRef attributesToUpdate) {
+    if (!orig_SecItemUpdate) return errSecParam;
+    CFMutableDictionaryRef strippedQuery = MVStripAccessGroup(query);
+    CFMutableDictionaryRef strippedAttrs = MVStripAccessGroup(attributesToUpdate);
+    if (strippedQuery || strippedAttrs) {
+        OSStatus st = orig_SecItemUpdate(strippedQuery ?: query, strippedAttrs ?: attributesToUpdate);
+        if (strippedQuery) CFRelease(strippedQuery);
+        if (strippedAttrs) CFRelease(strippedAttrs);
+        if (st == errSecSuccess || st == errSecItemNotFound) return st;
+    }
+    return orig_SecItemUpdate(query, attributesToUpdate);
+}
+
+static OSStatus mv_SecItemDelete(CFDictionaryRef query) {
+    if (!orig_SecItemDelete) return errSecParam;
+    CFMutableDictionaryRef stripped = MVStripAccessGroup(query);
+    if (stripped) {
+        OSStatus st = orig_SecItemDelete(stripped);
+        CFRelease(stripped);
+        if (st == errSecSuccess || st == errSecItemNotFound) return st;
+    }
+    return orig_SecItemDelete(query);
+}
+
 static void MVRebindMainImageOnly(void) {
     if (_dyld_image_count() == 0) return;
     const struct mach_header *hdr = _dyld_get_image_header(0);
@@ -188,6 +214,8 @@ static void MVRebindMainImageOnly(void) {
     struct rebinding rebs[] = {
         {"SecItemCopyMatching", (void *)mv_SecItemCopyMatching, (void **)&orig_SecItemCopyMatching},
         {"SecItemAdd", (void *)mv_SecItemAdd, (void **)&orig_SecItemAdd},
+        {"SecItemUpdate", (void *)mv_SecItemUpdate, (void **)&orig_SecItemUpdate},
+        {"SecItemDelete", (void *)mv_SecItemDelete, (void **)&orig_SecItemDelete},
     };
     rebind_symbols_image((void *)hdr, slide, rebs, sizeof(rebs) / sizeof(rebs[0]));
 }
