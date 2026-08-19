@@ -326,8 +326,13 @@ static BOOL MVShouldRenderTagged(id msg) {
 
 static id MVRenderTaggedValue(id msg, id originalValue) {
     if (!MVShouldRenderTagged(msg)) return originalValue;
+    NSString *pk = MVPkOfMessage(msg);
+    NSString *cached = pk.length ? gTextCache[pk] : nil;
     if ([originalValue isKindOfClass:[NSString class]]) {
-        return MVVisibleTaggedString((NSString *)originalValue);
+        NSString *orig = (NSString *)originalValue;
+        NSString *best = MVStripMarkers(orig);
+        if (!best.length && [cached isKindOfClass:[NSString class]]) best = MVStripMarkers(cached);
+        return MVVisibleTaggedString(best);
     }
     NSString *plain = MVPlainTextOfMessage(msg);
     if (!plain.length && [originalValue respondsToSelector:@selector(valueForKey:)]) {
@@ -336,6 +341,7 @@ static id MVRenderTaggedValue(id msg, id originalValue) {
             if ([t isKindOfClass:[NSString class]]) plain = t;
         } @catch (__unused NSException *ex) {}
     }
+    if (!plain.length && [cached isKindOfClass:[NSString class]]) plain = cached;
     plain = MVVisibleTaggedString(plain ?: @"");
     id neu = MVMakeMessageText(plain);
     return neu ?: originalValue;
