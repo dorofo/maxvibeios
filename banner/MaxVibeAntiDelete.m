@@ -597,7 +597,11 @@ static NSUInteger MVProcessIncomingDeletes(id seed, NSArray *list, NSMutableArra
               MVPkOfMessage(item), MVSenderIdOfMessage(item),
               MVMessageIsIncoming(item), (long)MVStatusOfMessage(item),
               (unsigned long)(MVPlainTextOfMessage(item) ?: @"").length);
-        if (MVMessageIsIncoming(item)) {
+        // If myUserId isn't available yet, MVMessageIsIncoming() may be false.
+        // In that case, still keep if we already know this message was deleted
+        // (stable-key hit). This prevents rare "disappears after hours".
+        BOOL keepThis = MVMessageIsIncoming(item) || MVDeletedKnownForMessage(item);
+        if (keepThis) {
             id full = MVLookupFullMessage(seed, item);
             MVConvertIncomingDelete(full);
             if (keptOut) [keptOut addObject:full];
