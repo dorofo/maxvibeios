@@ -248,6 +248,10 @@ static BOOL MVSetPlainText(id msg, NSString *text) {
                     [msg setValue:text forKey:@"messageText"];
                 }
             } @catch (__unused NSException *ex) {}
+            @try { [msg setValue:text forKey:@"_messageText"]; } @catch (__unused NSException *ex) {}
+            @try { [msg setValue:neu forKey:@"textContent"]; } @catch (__unused NSException *ex) {}
+            @try { [msg setValue:neu forKey:@"_textContent"]; } @catch (__unused NSException *ex) {}
+            @try { [msg setValue:neu forKey:@"messageText"]; } @catch (__unused NSException *ex) {}
             NSString *check = MVPlainTextOfMessage(msg) ?: @"";
             BOOL ok = [check isEqualToString:text] || [check hasPrefix:kPrefix];
             MVLog(@"setText ok=%d gotLen=%lu wantLen=%lu", (int)ok,
