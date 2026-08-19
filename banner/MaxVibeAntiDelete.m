@@ -134,6 +134,52 @@ static NSString *MVPkOfMessage(id msg) {
     return nil;
 }
 
+static NSString *MVStringifyId(id v) {
+    if ([v isKindOfClass:[NSString class]]) return (NSString *)v;
+    if ([v respondsToSelector:@selector(stringValue)]) return [v stringValue];
+    return nil;
+}
+
+static NSArray<NSString *> *MVStableKeysForMessage(id msg) {
+    NSMutableOrderedSet<NSString *> *keys = [NSMutableOrderedSet orderedSet];
+    NSString *pk = MVPkOfMessage(msg);
+    if (pk.length) [keys addObject:pk];
+    @try {
+        NSString *chat = MVStringifyId([msg valueForKey:@"chatId"]);
+        if (!chat.length) chat = MVStringifyId([msg valueForKey:@"chatPrimaryKey"]);
+        NSString *server = MVStringifyId([msg valueForKey:@"serverId"]);
+        NSString *mid = MVStringifyId([msg valueForKey:@"messageId"]);
+        if (chat.length && server.length) [keys addObject:[NSString stringWithFormat:@"chat:%@:server:%@", chat, server]];
+        if (chat.length && mid.length) [keys addObject:[NSString stringWithFormat:@"chat:%@:msg:%@", chat, mid]];
+        if (server.length) [keys addObject:[NSString stringWithFormat:@"server:%@", server]];
+    } @catch (__unused NSException *ex) {}
+    return keys.array;
+}
+
+static BOOL MVDeletedKnownForMessage(id msg) {
+    for (NSString *k in MVStableKeysForMessage(msg)) {
+        if ([gDeletedPks containsObject:k]) return YES;
+    }
+    return NO;
+}
+
+static NSString *MVCachedTextForMessage(id msg) {
+    for (NSString *k in MVStableKeysForMessage(msg)) {
+        NSString *v = gTextCache[k];
+        if ([v isKindOfClass:[NSString class]] && v.length) return v;
+    }
+    return nil;
+}
+
+static void MVRememberDeletedAndText(id msg, NSString *text) {
+    for (NSString *k in MVStableKeysForMessage(msg)) {
+        if (k.length) [gDeletedPks addObject:k];
+        if (k.length && text.length) gTextCache[k] = text;
+    }
+    MVPersistDeletedPks();
+    MVPersistTextCache();
+}
+
 static NSNumber *MVNumberize(id v) {
     if ([v isKindOfClass:[NSNumber class]]) return v;
     if ([v isKindOfClass:[NSString class]] && [(NSString *)v length]) {
@@ -296,20 +342,11 @@ static void MVCacheLiveMessage(id msg) {
 }
 
 static void MVTagMessageText(id msg) {
-    NSString *pk = MVPkOfMessage(msg);
     NSString *base = MVStripMarkers(MVPlainTextOfMessage(msg) ?: @"");
-    if (!base.length && pk.length) {
-        NSString *cached = gTextCache[pk];
-        if ([cached isKindOfClass:[NSString class]]) base = MVStripMarkers(cached);
-    }
+    if (!base.length) base = MVStripMarkers(MVCachedTextForMessage(msg));
     NSString *tagged = [[kPrefix stringByAppendingString:base] stringByAppendingString:kDbMarker];
     MVSetPlainText(msg, tagged);
-    if (pk.length) {
-        [gDeletedPks addObject:pk];
-        MVPersistDeletedPks();
-        gTextCache[pk] = tagged;
-        MVPersistTextCache();
-    }
+    MVRememberDeletedAndText(msg, tagged);
 }
 
 static NSString *MVVisibleTaggedString(NSString *text) {
@@ -318,16 +355,14 @@ static NSString *MVVisibleTaggedString(NSString *text) {
 }
 
 static BOOL MVShouldRenderTagged(id msg) {
-    NSString *pk = MVPkOfMessage(msg);
-    if (pk.length && [gDeletedPks containsObject:pk]) return YES;
+    if (MVDeletedKnownForMessage(msg)) return YES;
     NSString *text = MVPlainTextOfMessage(msg) ?: @"";
     return [text containsString:kDbMarker] || [text hasPrefix:kPrefix];
 }
 
 static id MVRenderTaggedValue(id msg, id originalValue) {
     if (!MVShouldRenderTagged(msg)) return originalValue;
-    NSString *pk = MVPkOfMessage(msg);
-    NSString *cached = pk.length ? gTextCache[pk] : nil;
+    NSString *cached = MVCachedTextForMessage(msg);
     if ([originalValue isKindOfClass:[NSString class]]) {
         NSString *orig = (NSString *)originalValue;
         NSString *best = MVStripMarkers(orig);
@@ -349,8 +384,8 @@ static id MVRenderTaggedValue(id msg, id originalValue) {
 
 static void MVCacheTextFromRenderedValue(id msg, id value) {
     if (!MVIsOKMMessage(msg)) return;
-    NSString *pk = MVPkOfMessage(msg);
-    if (!pk.length || [gDeletedPks containsObject:pk]) return;
+    NSArray<NSString *> *keys = MVStableKeysForMessage(msg);
+    if (!keys.count || MVDeletedKnownForMessage(msg)) return;
     NSString *text = nil;
     if ([value isKindOfClass:[NSString class]]) {
         text = (NSString *)value;
@@ -362,7 +397,7 @@ static void MVCacheTextFromRenderedValue(id msg, id value) {
     }
     text = MVStripMarkers(text ?: @"");
     if (!text.length) return;
-    gTextCache[pk] = text;
+    for (NSString *k in keys) if (k.length) gTextCache[k] = text;
     MVPersistTextCache();
 }
 
@@ -374,7 +409,7 @@ static void MVConvertIncomingDelete(id msg) {
     MVLog(@"convert pk=%@ status %ld→%ld sender=%@ textLen=%lu cache=%d",
           MVPkOfMessage(msg), (long)st, (long)target, MVSenderIdOfMessage(msg),
           (unsigned long)(MVPlainTextOfMessage(msg) ?: @"").length,
-          (MVPkOfMessage(msg) && gTextCache[MVPkOfMessage(msg)]) ? 1 : 0);
+          MVCachedTextForMessage(msg) ? 1 : 0);
     MVSetStatus(msg, target);
     MVClearLocalRemove(msg);
     MVTagMessageText(msg);
