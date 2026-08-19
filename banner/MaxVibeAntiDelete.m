@@ -347,6 +347,25 @@ static id MVRenderTaggedValue(id msg, id originalValue) {
     return neu ?: originalValue;
 }
 
+static void MVCacheTextFromRenderedValue(id msg, id value) {
+    if (!MVIsOKMMessage(msg)) return;
+    NSString *pk = MVPkOfMessage(msg);
+    if (!pk.length || [gDeletedPks containsObject:pk]) return;
+    NSString *text = nil;
+    if ([value isKindOfClass:[NSString class]]) {
+        text = (NSString *)value;
+    } else if (value) {
+        @try {
+            id t = [value valueForKey:@"text"];
+            if ([t isKindOfClass:[NSString class]]) text = t;
+        } @catch (__unused NSException *ex) {}
+    }
+    text = MVStripMarkers(text ?: @"");
+    if (!text.length) return;
+    gTextCache[pk] = text;
+    MVPersistTextCache();
+}
+
 static void MVConvertIncomingDelete(id msg) {
     NSInteger st = MVStatusOfMessage(msg);
     if (MVIsRemovedStatus(st)) gRemovedStatus = st;
@@ -569,16 +588,19 @@ static void mvibe_saveMessage(id self, SEL _cmd, id msg) {
 
 static id mvibe_messageText(id self, SEL _cmd) {
     id orig = gOrigMsgMessageText ? ((id (*)(id, SEL))gOrigMsgMessageText)(self, _cmd) : nil;
+    if (MaxVibeAntiDeleteEnabled()) MVCacheTextFromRenderedValue(self, orig);
     return MVRenderTaggedValue(self, orig);
 }
 
 static id mvibe_text(id self, SEL _cmd) {
     id orig = gOrigMsgText ? ((id (*)(id, SEL))gOrigMsgText)(self, _cmd) : nil;
+    if (MaxVibeAntiDeleteEnabled()) MVCacheTextFromRenderedValue(self, orig);
     return MVRenderTaggedValue(self, orig);
 }
 
 static id mvibe_textContent(id self, SEL _cmd) {
     id orig = gOrigMsgTextContent ? ((id (*)(id, SEL))gOrigMsgTextContent)(self, _cmd) : nil;
+    if (MaxVibeAntiDeleteEnabled()) MVCacheTextFromRenderedValue(self, orig);
     return MVRenderTaggedValue(self, orig);
 }
 
