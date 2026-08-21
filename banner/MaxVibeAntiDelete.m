@@ -1,19 +1,19 @@
 #import "MaxVibeAntiDelete.h"
-#import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <stdarg.h>
 
 /*
- * Anti-delete v17 — launch-safe again
+ * Anti-delete v14 — keep original body forever
  *
- * v16 crash on launch: C trampoline on OKMChatService _messagesUpdated
- * ended in doesNotRecognizeSelector (see MAX-2026-08-21-144850.ips).
- * Status getter swizzle also removed — unsafe with mixed TQ/Tq encodings.
+ * After hours, "❌ text" sometimes became just "❌" because:
+ *  - text cache stored tagged strings and later empty re-deletes overwrote them
+ *  - UserDefaults cache eviction dropped deleted-message keys
  *
- * Keep: push/delete-listener keep, okm_saveMessage rewrite for known/incoming
- * Removed rows (stops re-entry wipe), text getters for ❌, post-save UI nudge.
- * Live in-chat ❌ without flicker still needs a safer UI path (not this hook).
+ * v14:
+ *  - Cache stores ORIGINAL body only; never overwrite with empty/marker-only
+ *  - Eviction never drops keys present in deleted set
+ *  - Re-delete with blank body reuses cached original
  */
 
 static NSString * const kPrefKey = @"mvibe_anti_delete_enabled";
@@ -34,7 +34,6 @@ static NSInteger gEditedStatus = kStatusEditedDefault;
 
 static id gWriteConnection = nil;
 static id gYapDatabase = nil;
-static __weak id gChatService = nil;
 
 static IMP gOrigSetUserId = NULL;
 static IMP gOrigHandleDeleted = NULL;
@@ -46,7 +45,6 @@ static IMP gOrigMsgTextContent = NULL;
 static SEL gSelHandleDeleted;
 static SEL gSelMessagesDeleted;
 static SEL gSelSaveMessage;
-static SEL gSelMessagesUpdated;
 
 #pragma mark - Prefs
 
@@ -444,8 +442,6 @@ static void MVConvertIncomingDelete(id msg) {
     if (MVIsRemovedStatus(st)) gRemovedStatus = st;
     NSInteger target = gEditedStatus;
     if (MVIsRemovedStatus(target)) target = 0;
-    if (gPreferredLiveStatus > 0 && !MVIsRemovedStatus(gPreferredLiveStatus))
-        target = gPreferredLiveStatus;
     MVLog(@"convert pk=%@ status %ld→%ld sender=%@ textLen=%lu cache=%d",
           MVPkOfMessage(msg), (long)st, (long)target, MVSenderIdOfMessage(msg),
           (unsigned long)(MVPlainTextOfMessage(msg) ?: @"").length,
@@ -453,21 +449,6 @@ static void MVConvertIncomingDelete(id msg) {
     MVSetStatus(msg, target);
     MVClearLocalRemove(msg);
     MVTagMessageText(msg);
-}
-
-/** Keep peer wipe / already-marked rows. Never keep own outbound deletes. */
-static BOOL MVShouldKeepMessage(id msg) {
-    if (!MVIsOKMMessage(msg)) return NO;
-    if (MVDeletedKnownForMessage(msg)) return YES;
-    if (!MVIsRemovedStatus(MVStatusOfMessage(msg))) return NO;
-    return MVMessageIsIncoming(msg);
-}
-
-/** Rewrite in-place when we must keep; returns YES if converted. */
-static BOOL MVMaybeRewriteKeptMessage(id msg) {
-    if (!MaxVibeAntiDeleteEnabled() || !MVShouldKeepMessage(msg)) return NO;
-    MVConvertIncomingDelete(msg);
-    return YES;
 }
 
 #pragma mark - Yap
@@ -488,76 +469,6 @@ static void MVRememberConnection(id conn) {
     gWriteConnection = conn;
     id db = MVKVC(conn, @"database");
     if (db) gYapDatabase = db;
-}
-
-static void MVRememberChatService(id obj) {
-    if (!obj) return;
-    Class chatCls = NSClassFromString(@"OKMChatService");
-    if (chatCls && [obj isKindOfClass:chatCls]) {
-        gChatService = obj;
-        return;
-    }
-    SEL upd = NSSelectorFromString(@"_messagesUpdated:inTransaction:");
-    if ([obj respondsToSelector:upd]) gChatService = obj;
-}
-
-static id MVFindChatServiceFromSeed(id seed) {
-    if (gChatService) return gChatService;
-    if (!seed) return nil;
-    NSArray *keys = @[@"chatService", @"_chatService", @"messengerClient", @"_messengerClient",
-                      @"client", @"dependencies", @"_dependencies"];
-    NSMutableArray *queue = [NSMutableArray arrayWithObject:seed];
-    NSMutableSet *seen = [NSMutableSet set];
-    NSUInteger steps = 0;
-    while (queue.count && steps < 40) {
-        id obj = queue[0];
-        [queue removeObjectAtIndex:0];
-        if (!obj) continue;
-        NSValue *ptr = [NSValue valueWithPointer:(__bridge const void *)obj];
-        if ([seen containsObject:ptr]) continue;
-        [seen addObject:ptr];
-        steps++;
-        MVRememberChatService(obj);
-        if (gChatService) return gChatService;
-        for (NSString *k in keys) {
-            id n = MVKVC(obj, k);
-            if (n) [queue addObject:n];
-        }
-    }
-    return gChatService;
-}
-
-/** Walk visible VCs for chatService — needed when push helper has no link. */
-static id MVFindChatServiceFromUI(void) {
-    if (gChatService) return gChatService;
-    NSMutableArray *stack = [NSMutableArray array];
-    for (UIWindow *w in UIApplication.sharedApplication.windows) {
-        if (w.rootViewController) [stack addObject:w.rootViewController];
-    }
-    NSUInteger steps = 0;
-    while (stack.count && steps < 80) {
-        UIViewController *vc = stack[0];
-        [stack removeObjectAtIndex:0];
-        steps++;
-        id cs = MVKVC(vc, @"chatService");
-        if (!cs) cs = MVKVC(vc, @"_chatService");
-        MVRememberChatService(cs);
-        if (gChatService) return gChatService;
-        id deps = MVKVC(vc, @"dependencies");
-        if (deps) {
-            MVRememberChatService(MVKVC(deps, @"chatService"));
-            if (gChatService) return gChatService;
-        }
-        if (vc.presentedViewController) [stack addObject:vc.presentedViewController];
-        if ([vc isKindOfClass:[UINavigationController class]]) {
-            for (UIViewController *c in [(UINavigationController *)vc viewControllers]) [stack addObject:c];
-        } else if ([vc isKindOfClass:[UITabBarController class]]) {
-            for (UIViewController *c in [(UITabBarController *)vc viewControllers]) [stack addObject:c];
-        } else {
-            for (UIViewController *c in vc.childViewControllers) [stack addObject:c];
-        }
-    }
-    return gChatService;
 }
 
 static id MVFindConnectionFromSeed(id seed) {
@@ -582,7 +493,6 @@ static id MVFindConnectionFromSeed(id seed) {
         if ([seen containsObject:ptr]) continue;
         [seen addObject:ptr];
         steps++;
-        MVRememberChatService(obj);
         for (NSString *k in connKeys) {
             id c = MVKVC(obj, k);
             if (MVLooksLikeWriteConnection(c)) {
@@ -665,12 +575,11 @@ static id MVLookupFullMessage(id seed, id hint) {
 }
 
 static void MVPostYapModified(id conn) {
-    if (!conn && !gYapDatabase) return;
+    if (!conn) return;
     dispatch_async(dispatch_get_main_queue(), ^{
         @try {
-            id obj = gYapDatabase ?: conn;
             [[NSNotificationCenter defaultCenter] postNotificationName:@"YapDatabaseModifiedNotification"
-                                                                object:obj];
+                                                                object:conn];
             MVLog(@"posted YapDatabaseModifiedNotification");
         } @catch (NSException *ex) {
             MVLog(@"yap notify fail %@", ex.name);
@@ -678,66 +587,8 @@ static void MVPostYapModified(id conn) {
     });
 }
 
-/** CALL ChatService update so open chat can show kept msgs as edits. */
-static void MVCallMessagesUpdated(NSArray *msgs, id tx) {
-    if (!msgs.count) return;
-    id svc = gChatService ?: MVFindChatServiceFromUI();
-    if (!svc) {
-        MVLog(@"ui refresh skip: no ChatService");
-        return;
-    }
-    SEL sel = gSelMessagesUpdated ?: NSSelectorFromString(@"_messagesUpdated:inTransaction:");
-    if (![svc respondsToSelector:sel]) {
-        MVLog(@"ui refresh skip: no _messagesUpdated");
-        return;
-    }
-    @try {
-        ((void (*)(id, SEL, id, id))objc_msgSend)(svc, sel, msgs, tx);
-        MVLog(@"ui refresh _messagesUpdated count=%lu tx=%@",
-              (unsigned long)msgs.count, tx ? @"yes" : @"nil");
-    } @catch (NSException *ex) {
-        MVLog(@"ui refresh fail %@", ex.name);
-    }
-}
-
-static void MVRefreshOpenChatUI(NSArray *keptMsgs) {
-    if (!keptMsgs.count) return;
-    NSArray *snapshot = [keptMsgs copy];
-    void (^run)(void) = ^{
-        id conn = gWriteConnection;
-        if (conn) {
-            SEL syncRW = NSSelectorFromString(@"readWriteWithBlock:");
-            if ([conn respondsToSelector:syncRW]) {
-                @try {
-                    void (^write)(id) = ^(id tx) {
-                        SEL save = NSSelectorFromString(@"okm_saveMessage:");
-                        if ([tx respondsToSelector:save]) {
-                            for (id msg in snapshot) {
-                                MVMaybeRewriteKeptMessage(msg);
-                                ((void (*)(id, SEL, id))objc_msgSend)(tx, save, msg);
-                            }
-                        }
-                        MVCallMessagesUpdated(snapshot, tx);
-                    };
-                    ((void (*)(id, SEL, id))objc_msgSend)(conn, syncRW, write);
-                    MVPostYapModified(conn);
-                    return;
-                } @catch (NSException *ex) {
-                    MVLog(@"ui refresh rw %@", ex.name);
-                }
-            }
-        }
-        MVCallMessagesUpdated(snapshot, nil);
-        MVPostYapModified(conn);
-    };
-    dispatch_async(dispatch_get_main_queue(), run);
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.2 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), run);
-}
-
 static void MVSaveMessagesOnConn(id seed, NSArray *msgs) {
     if (!msgs.count) return;
-    MVFindChatServiceFromSeed(seed);
     id conn = MVFindConnectionFromSeed(seed);
     if (!conn) {
         MVLog(@"save skip: no conn");
@@ -764,7 +615,6 @@ static void MVSaveMessagesOnConn(id seed, NSArray *msgs) {
         if ([conn respondsToSelector:syncRW]) {
             ((void (*)(id, SEL, id))objc_msgSend)(conn, syncRW, write);
             MVPostYapModified(conn);
-            MVRefreshOpenChatUI(msgs);
         }
     } @catch (NSException *ex) {
         MVLog(@"save outer %@", ex.name);
@@ -786,7 +636,7 @@ static NSUInteger MVProcessIncomingDeletes(id seed, NSArray *list, NSMutableArra
         // If myUserId isn't available yet, MVMessageIsIncoming() may be false.
         // In that case, still keep if we already know this message was deleted
         // (stable-key hit). This prevents rare "disappears after hours".
-        BOOL keepThis = MVShouldKeepMessage(item);
+        BOOL keepThis = MVMessageIsIncoming(item) || MVDeletedKnownForMessage(item);
         if (keepThis) {
             id full = MVLookupFullMessage(seed, item);
             MVConvertIncomingDelete(full);
@@ -807,8 +657,6 @@ static void mvibe_setCurrentUserId(id self, SEL _cmd, NSNumber *uid) {
 }
 
 static void mvibe_saveMessage(id self, SEL _cmd, id msg) {
-    // Rewrite BEFORE Yap write so history can't load a Removed row we meant to keep.
-    if (MaxVibeAntiDeleteEnabled()) MVMaybeRewriteKeptMessage(msg);
     if (gOrigSaveMessage) ((void (*)(id, SEL, id))gOrigSaveMessage)(self, _cmd, msg);
     if (MaxVibeAntiDeleteEnabled()) MVCacheLiveMessage(msg);
 }
@@ -901,9 +749,8 @@ void MaxVibeInstallAntiDelete(void) {
         MVEnsureStore();
         gSelHandleDeleted = NSSelectorFromString(@"_handleDeletedMessages:inChatWithId:");
         gSelMessagesDeleted = NSSelectorFromString(@"_messagesDeleted:inChat:");
-        gSelMessagesUpdated = NSSelectorFromString(@"_messagesUpdated:inTransaction:");
         gSelSaveMessage = NSSelectorFromString(@"okm_saveMessage:");
-        MVLog(@"install begin v17 (launch-safe: no _messagesUpdated/status swizzle) enabled=%d",
+        MVLog(@"install begin v13 (launch-safe, no _messagesUpdated) enabled=%d",
               MaxVibeAntiDeleteEnabled());
 
         Class creds = NSClassFromString(@"OKMMessengerCredentials");
@@ -923,8 +770,6 @@ void MaxVibeInstallAntiDelete(void) {
         } else {
             MVLog(@"okm_saveMessage cache: FAIL");
         }
-
-        // Do NOT swizzle OKMChatService _messagesUpdated — v16 launch SIGABRT.
 
         Class del = NSClassFromString(@"OKMMessageDeleteListener");
         Method mDel = class_getInstanceMethod(del, gSelMessagesDeleted);
