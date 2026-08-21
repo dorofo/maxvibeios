@@ -2,9 +2,10 @@
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import "MaxVibeAntiDelete.h"
+#import "MaxVibeGhost.h"
 
 /*
- * MaxVibe: Telegram banner + native Settings row + soft persist fix + anti-delete.
+ * MaxVibe: Telegram banner + native Settings row + persist + anti-delete + ghost (3 toggles).
  */
 
 extern void MaxVibeInstallPersistFixes(void);
@@ -120,6 +121,7 @@ static char kMvibeSettingsRowKey;
     gDidSchedule = YES;
     MaxVibeInstallPersistFixes();
     MaxVibeInstallAntiDelete();
+    MaxVibeInstallGhost();
     [self installSettingsHooks];
 
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kInitialDelay * NSEC_PER_SEC)),
@@ -406,7 +408,7 @@ static char kMvibeSettingsRowKey;
     title.font = [UIFont systemFontOfSize:24 weight:UIFontWeightBold];
     title.translatesAutoresizingMaskIntoConstraints = NO;
     UILabel *sub = [[UILabel alloc] init];
-    sub.text = @"как на Android · Telegram, баннер, антиудаление"; sub.textColor = [self hex:0x8E858A alpha:1];
+    sub.text = @"как на Android · баннер, антиудаление, призрак"; sub.textColor = [self hex:0x8E858A alpha:1];
     sub.font = [UIFont systemFontOfSize:12]; sub.translatesAutoresizingMaskIntoConstraints = NO;
 
     UIImageView *hero = [[UIImageView alloc] initWithImage:[self bannerImage]];
@@ -427,6 +429,9 @@ static char kMvibeSettingsRowKey;
     [stack addArrangedSubview:[self settingsRowTitle:@"Telegram канал" subtitle:@"t.me/max_vibe" action:@selector(onSettingsTelegram) chevron:YES]];
     [stack addArrangedSubview:[self settingsRowTitle:[self bannerEnabled] ? @"Баннер: включён" : @"Баннер: выключен" subtitle:@"Стартовый баннер раз в сутки" action:@selector(onSettingsToggleBanner) chevron:NO]];
     [stack addArrangedSubview:[self settingsRowTitle:MaxVibeAntiDeleteEnabled() ? @"Антиудаление: включено" : @"Антиудаление: выключено" subtitle:@"v14: keep+❌ · оригинал текста не затирается" action:@selector(onSettingsToggleAntiDelete) chevron:NO]];
+    [stack addArrangedSubview:[self settingsRowTitle:MaxVibeHideOnlineEnabled() ? @"Не видно, что в сети: вкл" : @"Не видно, что в сети: выкл" subtitle:@"Собеседник не видит онлайн-статус" action:@selector(onSettingsToggleHideOnline) chevron:NO]];
+    [stack addArrangedSubview:[self settingsRowTitle:MaxVibeHideReadEnabled() ? @"Не видно, что прочитано: вкл" : @"Не видно, что прочитано: выкл" subtitle:@"Не отправлять галочки прочтения" action:@selector(onSettingsToggleHideRead) chevron:NO]];
+    [stack addArrangedSubview:[self settingsRowTitle:MaxVibeHideTypingEnabled() ? @"Не видно, что печатаю: вкл" : @"Не видно, что печатаю: выкл" subtitle:@"Собеседник не видит «печатает»" action:@selector(onSettingsToggleHideTyping) chevron:NO]];
     [stack addArrangedSubview:[self settingsRowTitle:@"Показать баннер сейчас" subtitle:@"Сбросить таймер" action:@selector(onSettingsForceBanner) chevron:YES]];
     [stack addArrangedSubview:[self settingsRowTitle:@"Сменить иконку" subtitle:@"Скоро" action:@selector(onSettingsStub) chevron:YES]];
     [stack addArrangedSubview:[self settingsRowTitle:@"Аккаунты" subtitle:@"Скоро" action:@selector(onSettingsStub) chevron:YES]];
@@ -459,7 +464,7 @@ static char kMvibeSettingsRowKey;
         [scroll.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:16],
         [scroll.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-16],
         [scroll.bottomAnchor constraintEqualToAnchor:card.bottomAnchor constant:-18],
-        [scroll.heightAnchor constraintEqualToConstant:320],
+        [scroll.heightAnchor constraintEqualToConstant:380],
         [stack.topAnchor constraintEqualToAnchor:scroll.topAnchor],
         [stack.leadingAnchor constraintEqualToAnchor:scroll.leadingAnchor],
         [stack.trailingAnchor constraintEqualToAnchor:scroll.trailingAnchor],
@@ -487,6 +492,18 @@ static char kMvibeSettingsRowKey;
 }
 - (void)onSettingsToggleAntiDelete {
     MaxVibeSetAntiDeleteEnabled(!MaxVibeAntiDeleteEnabled());
+    [self dismissSettings];
+}
+- (void)onSettingsToggleHideOnline {
+    MaxVibeSetHideOnlineEnabled(!MaxVibeHideOnlineEnabled());
+    [self dismissSettings];
+}
+- (void)onSettingsToggleHideRead {
+    MaxVibeSetHideReadEnabled(!MaxVibeHideReadEnabled());
+    [self dismissSettings];
+}
+- (void)onSettingsToggleHideTyping {
+    MaxVibeSetHideTypingEnabled(!MaxVibeHideTypingEnabled());
     [self dismissSettings];
 }
 - (void)onSettingsForceBanner {
@@ -618,6 +635,7 @@ static void MaxVibeModInit(void) {
     @autoreleasepool {
         MaxVibeInstallPersistFixes();
         MaxVibeInstallAntiDelete();
+        MaxVibeInstallGhost();
         dispatch_async(dispatch_get_main_queue(), ^{
             [[MaxVibeModController shared] start];
         });
