@@ -5,17 +5,15 @@
 #import <stdarg.h>
 
 /*
- * Anti-delete v14.2 — fight flicker without breaking first keep
+ * Anti-delete v14.3 — in-place _messagesUpdated (delayed install)
  *
- * v14.1 broke keep by changing ProcessIncomingDeletes to require Removed and by
- * rewriting ALL incoming Removed on save. Restored v14 keep rules.
+ * UI wipe happens in ChatService _messagesUpdated with status=Removed.
+ * Swizzle that replaced the messages collection → launch SIGABRT.
+ * Calling it after keep did nothing visible.
  *
- * v14.2:
- *  - Keep path unchanged: incoming || already-known
- *  - okm_saveMessage: ONLY rewrite if already in deleted set AND status=Removed
- *    (blocks late sync wipe that causes ❌ flash-then-gone on re-enter)
- *  - After keep / blocked late wipe: CALL _messagesUpdated (no swizzle) + delayed
- *    re-save so open chat shows ❌ and it sticks
+ * v14.3: install _messagesUpdated AFTER launch settle; mutate messages
+ * IN PLACE (same collection object); keep rules = v14 (incoming || known).
+ * Still block late Removed on okm_saveMessage for already-known keys only.
  */
 
 static NSString * const kPrefKey = @"mvibe_anti_delete_enabled";
@@ -38,11 +36,12 @@ static id gWriteConnection = nil;
 static id gYapDatabase = nil;
 static __weak id gChatService = nil;
 static int gOurSaveDepth = 0;
-static NSMutableSet *gNudgeCooldown = nil;
+static int gMessagesUpdatedDepth = 0;
 
 static IMP gOrigSetUserId = NULL;
 static IMP gOrigHandleDeleted = NULL;
 static IMP gOrigMessagesDeleted = NULL;
+static IMP gOrigMessagesUpdated = NULL;
 static IMP gOrigSaveMessage = NULL;
 static IMP gOrigProcessHistoryChunk = NULL;
 static IMP gOrigMsgMessageText = NULL;
@@ -634,23 +633,6 @@ static void MVPostYapModified(id conn) {
     });
 }
 
-static void MVCallMessagesUpdated(NSArray *msgs, id tx) {
-    if (!msgs.count) return;
-    id svc = gChatService ?: MVFindChatServiceFromUI();
-    if (!svc) {
-        MVLog(@"nudge skip: no ChatService");
-        return;
-    }
-    SEL sel = gSelMessagesUpdated ?: NSSelectorFromString(@"_messagesUpdated:inTransaction:");
-    if (![svc respondsToSelector:sel]) return;
-    @try {
-        ((void (*)(id, SEL, id, id))objc_msgSend)(svc, sel, msgs, tx);
-        MVLog(@"nudge _messagesUpdated n=%lu", (unsigned long)msgs.count);
-    } @catch (NSException *ex) {
-        MVLog(@"nudge fail %@", ex.name);
-    }
-}
-
 static void MVSaveMessagesOnConn(id seed, NSArray *msgs) {
     if (!msgs.count) return;
     MVRememberChatService(seed);
@@ -689,57 +671,6 @@ static void MVSaveMessagesOnConn(id seed, NSArray *msgs) {
     }
 }
 
-/** Show/keep ❌ in open chat. Never changes first-keep rules — only UI + re-save. */
-static void MVNudgeKeptVisible(id seed, NSArray *msgs) {
-    if (!msgs.count) return;
-    NSArray *snapshot = [msgs copy];
-    void (^once)(void) = ^{
-        for (id m in snapshot) {
-            if (MVDeletedKnownForMessage(m) || MVMessageIsIncoming(m))
-                MVConvertIncomingDelete(m);
-        }
-        MVSaveMessagesOnConn(seed ?: gChatService, snapshot);
-        id conn = gWriteConnection;
-        if (conn) {
-            SEL syncRW = NSSelectorFromString(@"readWriteWithBlock:");
-            if ([conn respondsToSelector:syncRW]) {
-                @try {
-                    void (^w)(id) = ^(id tx) { MVCallMessagesUpdated(snapshot, tx); };
-                    gOurSaveDepth++;
-                    ((void (*)(id, SEL, id))objc_msgSend)(conn, syncRW, w);
-                    gOurSaveDepth--;
-                } @catch (__unused NSException *ex) {
-                    gOurSaveDepth = MAX(0, gOurSaveDepth - 1);
-                    MVCallMessagesUpdated(snapshot, nil);
-                }
-                return;
-            }
-        }
-        MVCallMessagesUpdated(snapshot, nil);
-    };
-    dispatch_async(dispatch_get_main_queue(), once);
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), once);
-}
-
-static void MVNudgeIfCooldownAllows(id seed, NSArray *msgs) {
-    if (!msgs.count) return;
-    if (!gNudgeCooldown) gNudgeCooldown = [NSMutableSet set];
-    NSMutableArray *fresh = [NSMutableArray array];
-    for (id m in msgs) {
-        NSString *pk = MVPkOfMessage(m);
-        if (!pk.length) continue;
-        if ([gNudgeCooldown containsObject:pk]) continue;
-        [gNudgeCooldown addObject:pk];
-        [fresh addObject:m];
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            [gNudgeCooldown removeObject:pk];
-        });
-    }
-    if (fresh.count) MVNudgeKeptVisible(seed, fresh);
-}
-
 /** Shared keep logic for push + delete listener paths. */
 static NSUInteger MVProcessIncomingDeletes(id seed, NSArray *list, NSMutableArray *allowOut, NSMutableArray *keptOut) {
     NSUInteger kept = 0;
@@ -776,28 +707,17 @@ static void mvibe_setCurrentUserId(id self, SEL _cmd, NSNumber *uid) {
 }
 
 static void mvibe_saveMessage(id self, SEL _cmd, id msg) {
-    // ONLY touch already-known deleted rows being re-killed as Removed.
-    // Do NOT rewrite first-time incoming Removed here — that broke keep in v14.1.
-    BOOL blockedLate = NO;
+    // Already-known deleted row being re-saved as Removed (re-enter flicker source).
     if (MaxVibeAntiDeleteEnabled() && MVIsOKMMessage(msg) &&
         MVDeletedKnownForMessage(msg) && MVIsRemovedStatus(MVStatusOfMessage(msg))) {
         MVConvertIncomingDelete(msg);
-        // Nudge UI only for external late wipes, not our own re-saves.
-        if (gOurSaveDepth == 0) blockedLate = YES;
-        MVLog(@"save blocked late Removed pk=%@ nudge=%d", MVPkOfMessage(msg), (int)blockedLate);
+        MVLog(@"save blocked late Removed pk=%@", MVPkOfMessage(msg));
     }
     if (gOrigSaveMessage) ((void (*)(id, SEL, id))gOrigSaveMessage)(self, _cmd, msg);
     if (MaxVibeAntiDeleteEnabled()) MVCacheLiveMessage(msg);
-    if (blockedLate) {
-        id retained = msg;
-        dispatch_async(dispatch_get_main_queue(), ^{
-            MVNudgeIfCooldownAllows(nil, @[retained]);
-        });
-    }
 }
 
 static void mvibe_processHistoryChunk(id self, SEL _cmd, id chunk, BOOL notify) {
-    // In-place fix for known deleted rows that history re-applies as Removed.
     if (MaxVibeAntiDeleteEnabled() && [chunk isKindOfClass:[NSArray class]]) {
         for (id item in (NSArray *)chunk) {
             if (!MVIsOKMMessage(item)) continue;
@@ -808,6 +728,36 @@ static void mvibe_processHistoryChunk(id self, SEL _cmd, id chunk, BOOL notify) 
     }
     if (gOrigProcessHistoryChunk)
         ((void (*)(id, SEL, id, BOOL))gOrigProcessHistoryChunk)(self, _cmd, chunk, notify);
+}
+
+/** In-place rewrite — never replace `messages` collection (that crashed v16). */
+static void mvibe_messagesUpdated(id self, SEL _cmd, id messages, id tx) {
+    MVRememberChatService(self);
+    if (!gOrigMessagesUpdated) return;
+
+    if (MaxVibeAntiDeleteEnabled() && messages && gMessagesUpdatedDepth == 0) {
+        @try {
+            NSUInteger n = 0;
+            // Fast enumeration works for NSArray and NSSet without copying.
+            for (id item in messages) {
+                if (!MVIsOKMMessage(item)) continue;
+                BOOL known = MVDeletedKnownForMessage(item);
+                BOOL incoming = MVMessageIsIncoming(item);
+                if (!(incoming || known)) continue;
+                NSInteger st = MVStatusOfMessage(item);
+                if (!(MVIsRemovedStatus(st) || known)) continue;
+                MVConvertIncomingDelete(item);
+                n++;
+            }
+            if (n) MVLog(@"messagesUpdated in-place keep=%lu", (unsigned long)n);
+        } @catch (NSException *ex) {
+            MVLog(@"messagesUpdated catch %@", ex.name);
+        }
+    }
+
+    gMessagesUpdatedDepth++;
+    ((void (*)(id, SEL, id, id))gOrigMessagesUpdated)(self, _cmd, messages, tx);
+    gMessagesUpdatedDepth--;
 }
 
 static id mvibe_messageText(id self, SEL _cmd) {
@@ -850,10 +800,7 @@ static void mvibe_handleDeletedMessages(id self, SEL _cmd, id messages, id chatI
     NSUInteger keptN = MVProcessIncomingDeletes(self, list, allow, kept);
     MVLog(@"handleDeletedMessages chat=%@ keep=%lu allow=%lu",
           chatId, (unsigned long)keptN, (unsigned long)allow.count);
-    if (kept.count) {
-        MVSaveMessagesOnConn(self, kept);
-        MVNudgeIfCooldownAllows(self, kept);
-    }
+    if (kept.count) MVSaveMessagesOnConn(self, kept);
 
     if (allow.count == 0) return;
     if (allow.count == list.count) {
@@ -885,10 +832,7 @@ static void mvibe_messagesDeleted(id self, SEL _cmd, id messages, id chat) {
     NSUInteger keptN = MVProcessIncomingDeletes(self, list, allow, kept);
     MVLog(@"messagesDeleted chat=%@ keep=%lu allow=%lu",
           chat, (unsigned long)keptN, (unsigned long)allow.count);
-    if (kept.count) {
-        MVSaveMessagesOnConn(self, kept);
-        MVNudgeIfCooldownAllows(self, kept);
-    }
+    if (kept.count) MVSaveMessagesOnConn(self, kept);
 
     if (allow.count == 0) return;
     if (allow.count == list.count) {
@@ -896,6 +840,20 @@ static void mvibe_messagesDeleted(id self, SEL _cmd, id messages, id chat) {
     } else {
         ((void (*)(id, SEL, id, id))gOrigMessagesDeleted)(self, _cmd, allow, chat);
     }
+}
+
+static void MVInstallMessagesUpdatedHook(void) {
+    if (gOrigMessagesUpdated) return;
+    Class chatSvc = NSClassFromString(@"OKMChatService");
+    SEL sel = gSelMessagesUpdated ?: NSSelectorFromString(@"_messagesUpdated:inTransaction:");
+    Method m = class_getInstanceMethod(chatSvc, sel);
+    if (!m) {
+        MVLog(@"_messagesUpdated delayed: FAIL no method");
+        return;
+    }
+    gOrigMessagesUpdated = method_getImplementation(m);
+    method_setImplementation(m, (IMP)mvibe_messagesUpdated);
+    MVLog(@"_messagesUpdated delayed in-place: OK");
 }
 
 void MaxVibeInstallAntiDelete(void) {
@@ -907,7 +865,7 @@ void MaxVibeInstallAntiDelete(void) {
         gSelSaveMessage = NSSelectorFromString(@"okm_saveMessage:");
         gSelMessagesUpdated = NSSelectorFromString(@"_messagesUpdated:inTransaction:");
         gSelProcessHistoryChunk = NSSelectorFromString(@"processHistoryChunk:notify:");
-        MVLog(@"install begin v14.2 (late-Removed block + UI nudge, keep rules=v14) enabled=%d",
+        MVLog(@"install begin v14.3 (delayed in-place _messagesUpdated) enabled=%d",
               MaxVibeAntiDeleteEnabled());
 
         Class creds = NSClassFromString(@"OKMMessengerCredentials");
@@ -978,6 +936,12 @@ void MaxVibeInstallAntiDelete(void) {
             MVLog(@"OKMMessage textContent: OK");
         }
 
-        MVLog(@"install done my=%@", gMyUserId);
+        // Delay UI wipe hook past launch/login sync — early install crashed before.
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.0 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            MVInstallMessagesUpdatedHook();
+        });
+
+        MVLog(@"install done my=%@ (messagesUpdated pending)", gMyUserId);
     });
 }
