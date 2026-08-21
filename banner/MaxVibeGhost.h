@@ -16,6 +16,9 @@ void MaxVibeSetHideReadEnabled(BOOL enabled);
 BOOL MaxVibeHideTypingEnabled(void);
 void MaxVibeSetHideTypingEnabled(BOOL enabled);
 
+BOOL MaxVibeHideVpnEnabled(void);
+void MaxVibeSetHideVpnEnabled(BOOL enabled);
+
 #ifdef __cplusplus
 }
 #endif

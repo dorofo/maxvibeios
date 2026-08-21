@@ -432,6 +432,7 @@ static char kMvibeSettingsRowKey;
     [stack addArrangedSubview:[self settingsRowTitle:MaxVibeHideOnlineEnabled() ? @"Не видно, что в сети: вкл" : @"Не видно, что в сети: выкл" subtitle:@"Собеседник не видит онлайн-статус" action:@selector(onSettingsToggleHideOnline) chevron:NO]];
     [stack addArrangedSubview:[self settingsRowTitle:MaxVibeHideReadEnabled() ? @"Не видно, что прочитано: вкл" : @"Не видно, что прочитано: выкл" subtitle:@"Не отправлять галочки прочтения" action:@selector(onSettingsToggleHideRead) chevron:NO]];
     [stack addArrangedSubview:[self settingsRowTitle:MaxVibeHideTypingEnabled() ? @"Не видно, что печатаю: вкл" : @"Не видно, что печатаю: выкл" subtitle:@"Собеседник не видит «печатает»" action:@selector(onSettingsToggleHideTyping) chevron:NO]];
+    [stack addArrangedSubview:[self settingsRowTitle:MaxVibeHideVpnEnabled() ? @"Скрыть VPN: вкл" : @"Скрыть VPN: выкл" subtitle:@"Без баннера «отключите VPN»" action:@selector(onSettingsToggleHideVpn) chevron:NO]];
     [stack addArrangedSubview:[self settingsRowTitle:@"Показать баннер сейчас" subtitle:@"Сбросить таймер" action:@selector(onSettingsForceBanner) chevron:YES]];
     [stack addArrangedSubview:[self settingsRowTitle:@"Сменить иконку" subtitle:@"Скоро" action:@selector(onSettingsStub) chevron:YES]];
     [stack addArrangedSubview:[self settingsRowTitle:@"Аккаунты" subtitle:@"Скоро" action:@selector(onSettingsStub) chevron:YES]];
@@ -464,7 +465,7 @@ static char kMvibeSettingsRowKey;
         [scroll.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:16],
         [scroll.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-16],
         [scroll.bottomAnchor constraintEqualToAnchor:card.bottomAnchor constant:-18],
-        [scroll.heightAnchor constraintEqualToConstant:380],
+        [scroll.heightAnchor constraintEqualToConstant:420],
         [stack.topAnchor constraintEqualToAnchor:scroll.topAnchor],
         [stack.leadingAnchor constraintEqualToAnchor:scroll.leadingAnchor],
         [stack.trailingAnchor constraintEqualToAnchor:scroll.trailingAnchor],
@@ -504,6 +505,10 @@ static char kMvibeSettingsRowKey;
 }
 - (void)onSettingsToggleHideTyping {
     MaxVibeSetHideTypingEnabled(!MaxVibeHideTypingEnabled());
+    [self dismissSettings];
+}
+- (void)onSettingsToggleHideVpn {
+    MaxVibeSetHideVpnEnabled(!MaxVibeHideVpnEnabled());
     [self dismissSettings];
 }
 - (void)onSettingsForceBanner {
