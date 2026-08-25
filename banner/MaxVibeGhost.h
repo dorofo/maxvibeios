@@ -22,6 +22,9 @@ void MaxVibeSetHideVpnEnabled(BOOL enabled);
 /** Extra VPN pass after UIKit is up (named + VPNRestriction classes only). */
 void MaxVibeRefreshVPNHooks(void);
 
+/** Hide composer VPN overlay if hide-VPN is on (safe on main thread). */
+void MaxVibeStripVPNRestrictionUI(void);
+
 #ifdef __cplusplus
 }
 #endif
