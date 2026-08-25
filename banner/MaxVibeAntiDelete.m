@@ -46,8 +46,6 @@ static IMP gOrigMsgTextContent = NULL;
 static SEL gSelHandleDeleted;
 static SEL gSelMessagesDeleted;
 static SEL gSelSaveMessage;
-/* KVC on text/messageText/textContent re-enters these hooks and overflows the stack. */
-static _Thread_local int gTextHookDepth;
 
 #pragma mark - Prefs
 
@@ -314,10 +312,12 @@ static BOOL MVIsRemovedStatus(NSInteger st) {
 static NSString *MVStringFromTextValue(id value) {
     if ([value isKindOfClass:[NSString class]]) return value;
     if (!value) return nil;
+    SEL textSel = @selector(text);
+    if (![value respondsToSelector:textSel]) return nil;
     @try {
-        id t = [value valueForKey:@"text"];
+        id t = ((id (*)(id, SEL))objc_msgSend)(value, textSel);
         if ([t isKindOfClass:[NSString class]]) return t;
-    } @catch (__unused NSException *ex) {}
+    } @catch (__unused id ex) {}
     return nil;
 }
 
@@ -708,36 +708,6 @@ static void mvibe_saveMessage(id self, SEL _cmd, id msg) {
     if (MaxVibeAntiDeleteEnabled()) MVCacheLiveMessage(msg);
 }
 
-static id MVHookedTextGetter(id self, SEL _cmd, IMP origImp) {
-    if (!origImp) return nil;
-    if (gTextHookDepth > 0) {
-        return ((id (*)(id, SEL))origImp)(self, _cmd);
-    }
-    gTextHookDepth++;
-    id orig = ((id (*)(id, SEL))origImp)(self, _cmd);
-    id result = orig;
-    @try {
-        if (MaxVibeAntiDeleteEnabled()) MVCacheTextFromRenderedValue(self, orig);
-        result = MVRenderTaggedValue(self, orig);
-    } @catch (__unused NSException *ex) {
-        result = orig;
-    }
-    gTextHookDepth--;
-    return result;
-}
-
-static id mvibe_messageText(id self, SEL _cmd) {
-    return MVHookedTextGetter(self, _cmd, gOrigMsgMessageText);
-}
-
-static id mvibe_text(id self, SEL _cmd) {
-    return MVHookedTextGetter(self, _cmd, gOrigMsgText);
-}
-
-static id mvibe_textContent(id self, SEL _cmd) {
-    return MVHookedTextGetter(self, _cmd, gOrigMsgTextContent);
-}
-
 static void mvibe_handleDeletedMessages(id self, SEL _cmd, id messages, id chatId) {
     MVEnsureStore();
     if (!MaxVibeAntiDeleteEnabled() || !gOrigHandleDeleted) {
@@ -852,23 +822,12 @@ void MaxVibeInstallAntiDelete(void) {
 
         Class msg = NSClassFromString(@"OKMMessage");
         Method mMsgText = class_getInstanceMethod(msg, NSSelectorFromString(@"messageText"));
-        if (mMsgText) {
-            gOrigMsgMessageText = method_getImplementation(mMsgText);
-            method_setImplementation(mMsgText, (IMP)mvibe_messageText);
-            MVLog(@"OKMMessage messageText: OK");
-        }
+        if (mMsgText) gOrigMsgMessageText = method_getImplementation(mMsgText);
         Method mText = class_getInstanceMethod(msg, NSSelectorFromString(@"text"));
-        if (mText) {
-            gOrigMsgText = method_getImplementation(mText);
-            method_setImplementation(mText, (IMP)mvibe_text);
-            MVLog(@"OKMMessage text: OK");
-        }
+        if (mText) gOrigMsgText = method_getImplementation(mText);
         Method mTextContent = class_getInstanceMethod(msg, NSSelectorFromString(@"textContent"));
-        if (mTextContent) {
-            gOrigMsgTextContent = method_getImplementation(mTextContent);
-            method_setImplementation(mTextContent, (IMP)mvibe_textContent);
-            MVLog(@"OKMMessage textContent: OK");
-        }
+        if (mTextContent) gOrigMsgTextContent = method_getImplementation(mTextContent);
+        MVLog(@"OKMMessage text getters: unhooked");
 
         MVLog(@"install done my=%@", gMyUserId);
     });

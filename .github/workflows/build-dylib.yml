@@ -22,6 +22,7 @@ jobs:
             -target arm64-apple-ios15.0 \
             -isysroot "$SDK" \
             -fobjc-arc \
+            -fobjc-exceptions \
             -I banner \
             -framework Foundation \
             -framework UIKit \

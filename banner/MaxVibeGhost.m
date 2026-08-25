@@ -147,9 +147,7 @@ static IMP gOrigPingInteractive = NULL;
 static IMP gOrigSendPingIfNeeded = NULL;
 static IMP gOrigSetInteractive = NULL;
 static IMP gOrigRMPerform = NULL;
-static IMP gOrigRMWork = NULL;
 static IMP gOrigBRPerform = NULL;
-static IMP gOrigBRWork = NULL;
 static IMP gOrigPresentVC = NULL;
 static IMP gOrigShowVC = NULL;
 static NSMutableDictionary *gOrigByKey = nil;
@@ -227,19 +225,9 @@ static void mvibe_rmPerform(id self, SEL _cmd) {
     if (MVShouldBlockReadTask(self)) return;
     if (gOrigRMPerform) ((void (*)(id, SEL))gOrigRMPerform)(self, _cmd);
 }
-static id mvibe_rmWork(id self, SEL _cmd) {
-    if (MVShouldBlockReadTask(self)) return nil;
-    if (gOrigRMWork) return ((id (*)(id, SEL))gOrigRMWork)(self, _cmd);
-    return nil;
-}
 static void mvibe_brPerform(id self, SEL _cmd) {
     if (MVShouldBlockReadTask(self)) return;
     if (gOrigBRPerform) ((void (*)(id, SEL))gOrigBRPerform)(self, _cmd);
-}
-static id mvibe_brWork(id self, SEL _cmd) {
-    if (MVShouldBlockReadTask(self)) return nil;
-    if (gOrigBRWork) return ((id (*)(id, SEL))gOrigBRWork)(self, _cmd);
-    return nil;
 }
 
 #pragma mark - Online / ping
@@ -467,13 +455,9 @@ void MaxVibeInstallGhost(void) {
         Class readMark = NSClassFromString(@"OKMReadMarkTask");
         MVAddSubclassHook(readMark, NSSelectorFromString(@"perform"),
                           (IMP)mvibe_rmPerform, &gOrigRMPerform, @"ReadMark perform");
-        MVAddSubclassHook(readMark, NSSelectorFromString(@"performWorkSignal"),
-                          (IMP)mvibe_rmWork, &gOrigRMWork, @"ReadMark performWorkSignal");
         Class batchRead = NSClassFromString(@"OKMBatchReadLogTask");
         MVAddSubclassHook(batchRead, NSSelectorFromString(@"perform"),
                           (IMP)mvibe_brPerform, &gOrigBRPerform, @"BatchRead perform");
-        MVAddSubclassHook(batchRead, NSSelectorFromString(@"performWorkSignal"),
-                          (IMP)mvibe_brWork, &gOrigBRWork, @"BatchRead performWorkSignal");
 
         Class client = NSClassFromString(@"OKMMessengerClient");
         MVHookOwn(client, NSSelectorFromString(@"_reschedulePingTimerWithForInteractive:"),
