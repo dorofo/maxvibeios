@@ -3,6 +3,7 @@
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <notify.h>
+#import <spawn.h>
 #import "MaxVibeAntiDelete.h"
 #import "MaxVibeGhost.h"
 
@@ -124,6 +125,7 @@ static char kMvibeSettingsRowKey;
     MaxVibeInstallPersistFixes();
     MaxVibeInstallAntiDelete();
     MaxVibeInstallGhost();
+    MaxVibeRefreshVPNHooks();
     [self installSettingsHooks];
 
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kInitialDelay * NSEC_PER_SEC)),
@@ -584,33 +586,88 @@ static char kMvibeSettingsRowKey;
     @try {
         notify_post("com.apple.LaunchServices.databaseUpdated");
         notify_post("com.apple.mobile.application_installed");
+        notify_post("com.apple.LaunchServices.applicationRegistered");
         Class ls = NSClassFromString(@"LSApplicationWorkspace");
         SEL defSel = NSSelectorFromString(@"defaultWorkspace");
         if (!ls || ![ls respondsToSelector:defSel]) return;
         id ws = ((id (*)(id, SEL))objc_msgSend)(ls, defSel);
         if (!ws) return;
+        NSString *bid = [NSBundle mainBundle].bundleIdentifier;
         NSURL *url = [NSBundle mainBundle].bundleURL;
+        NSString *bundlePath = [NSBundle mainBundle].bundlePath;
         SEL inv = NSSelectorFromString(@"invalidateIconCache:");
         if ([ws respondsToSelector:inv]) {
+            ((void (*)(id, SEL, id))objc_msgSend)(ws, inv, bid);
             ((void (*)(id, SEL, id))objc_msgSend)(ws, inv, nil);
         }
         SEL recache = NSSelectorFromString(@"registerApplication:");
         if ([ws respondsToSelector:recache]) {
             ((BOOL (*)(id, SEL, id))objc_msgSend)(ws, recache, url);
         }
+        NSString *plistPath = [bundlePath stringByAppendingPathComponent:@"Info.plist"];
+        NSMutableDictionary *info = [NSMutableDictionary dictionaryWithContentsOfFile:plistPath];
+        if (info) {
+            info[@"Path"] = bundlePath;
+            info[@"CFBundleIdentifier"] = bid ?: @"";
+            info[@"ApplicationType"] = @"User";
+            SEL regDict = NSSelectorFromString(@"registerApplicationDictionary:");
+            if ([ws respondsToSelector:regDict]) {
+                ((BOOL (*)(id, SEL, id))objc_msgSend)(ws, regDict, info);
+            }
+        }
+        [self spawnTrollStoreRefresh:bundlePath];
     } @catch (__unused NSException *ex) {}
+}
+
+- (void)spawnTrollStoreRefresh:(NSString *)bundlePath {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSMutableArray *helpers = [NSMutableArray array];
+    NSArray *roots = @[
+        @"/var/containers/Bundle/Application",
+        @"/var/containers/Bundle/TrollStore",
+        @"/Applications",
+    ];
+    for (NSString *root in roots) {
+        NSArray *kids = [fm contentsOfDirectoryAtPath:root error:nil];
+        for (NSString *kid in kids) {
+            NSString *p = [[root stringByAppendingPathComponent:kid] stringByAppendingPathComponent:@"TrollStore.app/trollstorehelper"];
+            if ([fm isExecutableFileAtPath:p]) [helpers addObject:p];
+            NSString *p2 = [root stringByAppendingPathComponent:@"trollstorehelper"];
+            if ([kid isEqualToString:@"trollstorehelper"] && [fm isExecutableFileAtPath:p2]) [helpers addObject:p2];
+        }
+    }
+    NSString *direct = @"/var/containers/Bundle/TrollStore/TrollStore.app/trollstorehelper";
+    if ([fm isExecutableFileAtPath:direct]) [helpers addObject:direct];
+    if (!helpers.count) return;
+    NSString *helper = helpers.firstObject;
+    pid_t pid = 0;
+    const char *args[] = {
+        helper.UTF8String,
+        "refresh-path",
+        bundlePath.UTF8String,
+        NULL
+    };
+    extern char **environ;
+    posix_spawn(&pid, helper.UTF8String, NULL, NULL, (char *const *)args, environ);
 }
 
 - (void)applyHomeScreenNameForIcon:(NSString *)iconName {
     NSString *label = [self homeScreenNameForIcon:iconName];
     NSString *bundle = [NSBundle mainBundle].bundlePath;
-    [self writePlistFile:[bundle stringByAppendingPathComponent:@"Info.plist"] setName:label];
+    BOOL ok = [self writePlistFile:[bundle stringByAppendingPathComponent:@"Info.plist"] setName:label];
     for (NSString *loc in @[@"en.lproj", @"ru.lproj"]) {
         NSString *path = [[bundle stringByAppendingPathComponent:loc] stringByAppendingPathComponent:@"InfoPlist.strings"];
-        [self writePlistFile:path setName:label];
+        if ([self writePlistFile:path setName:label]) ok = YES;
     }
     [self refreshSpringBoardName];
-    NSLog(@"[MaxVibe] home screen name -> %@", label);
+    NSLog(@"[MaxVibe] home screen name -> %@ write=%d", label, ok);
+    if (!ok) {
+        UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"MaxVibe"
+                                                                   message:@"Иконка сменится, а имя на рабочем столе — только если приложение стоит через TrollStore. После смены: TrollStore → Refresh App Registrations."
+                                                            preferredStyle:UIAlertControllerStyleAlert];
+        [ac addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+        [[self settingsPresentingController] presentViewController:ac animated:YES completion:nil];
+    }
 }
 
 - (void)applyAlternateIcon:(NSString *)name {

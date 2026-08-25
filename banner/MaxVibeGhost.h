@@ -19,6 +19,9 @@ void MaxVibeSetHideTypingEnabled(BOOL enabled);
 BOOL MaxVibeHideVpnEnabled(void);
 void MaxVibeSetHideVpnEnabled(BOOL enabled);
 
+/** Extra VPN pass after UIKit is up (named + VPNRestriction classes only). */
+void MaxVibeRefreshVPNHooks(void);
+
 #ifdef __cplusplus
 }
 #endif

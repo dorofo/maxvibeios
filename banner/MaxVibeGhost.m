@@ -1,4 +1,5 @@
 #import "MaxVibeGhost.h"
+#import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <stdarg.h>
@@ -7,15 +8,15 @@
 /*
  * MaxVibe privacy toggles (default OFF, runtime flag is source of truth).
  *
- * hide-read    — drop single enqueueTask: of OKMReadMarkTask + no-op performWork
- *                (do NOT filter enqueueTasks:withDependencies: — that broke replies)
+ * hide-read    — drop OKMReadMarkTask via enqueueTask: only
+ *                (never hook OKMBaseTask perform / performWorkSignal — that crashed
+ *                reply send with -[x takeUntil:])
  * hide-typing  — no-op typing sender start/timer + TypingService userDidType
  * hide-online  — force ping interactive=NO on OKMMessengerClient (Android tgc)
- * hide-vpn     — named VPN classes only (no objc_copyClassList, no delayed walk)
+ * hide-vpn     — VPNRestriction/OMVPN classes + block present of that VC
  *
  * Never hook sendData: (ABI / MSG_SEND reply link).
- * Never hook inherited methods (class_copyMethodList / MVOwnMethod only),
- * except OKMBaseTask.performWorkSignal with an explicit class filter.
+ * Never hook OKMBaseTask perform / performWorkSignal (reply crash: takeUntil:).
  * Never hook serializeBlock (sticker panel).
  */
 
@@ -116,18 +117,6 @@ static BOOL MVHookOwn(Class cls, SEL sel, IMP replacement, IMP *origOut, NSStrin
     return YES;
 }
 
-static id MVEmptySignal(void) {
-    Class rac = NSClassFromString(@"RACSignal");
-    if ([rac respondsToSelector:@selector(empty)]) {
-        return ((id (*)(id, SEL))objc_msgSend)(rac, @selector(empty));
-    }
-    SEL retSel = NSSelectorFromString(@"return:");
-    if ([rac respondsToSelector:retSel]) {
-        return ((id (*)(id, SEL, id))objc_msgSend)(rac, retSel, nil);
-    }
-    return nil;
-}
-
 static BOOL MVIsReadTask(id task) {
     if (!task) return NO;
     NSString *cls = NSStringFromClass([task class]);
@@ -160,10 +149,9 @@ static IMP gOrigSendTypingNotif = NULL;
 static IMP gOrigPingInteractive = NULL;
 static IMP gOrigSendPingIfNeeded = NULL;
 static IMP gOrigSetInteractive = NULL;
-static IMP gOrigPerformWork = NULL;
-static IMP gOrigBatchPerformWork = NULL;
-static IMP gOrigPerform = NULL;
 static IMP gOrigEnqueueTask = NULL;
+static IMP gOrigPresentVC = NULL;
+static IMP gOrigShowVC = NULL;
 static NSMutableDictionary *gOrigByKey = nil;
 
 static NSString *MVOrigKey(Class cls, SEL sel) {
@@ -211,27 +199,6 @@ static BOOL MVShouldBlockReadTask(id task) {
     return MaxVibeHideReadEnabled() && MVIsReadTask(task) && !MVReadTaskIsUnreadMark(task);
 }
 
-static id mvibe_performWork(id self, SEL _cmd) {
-    if (MVShouldBlockReadTask(self)) {
-        MVGLog(@"performWorkSignal skip %@", NSStringFromClass([self class]));
-        return MVEmptySignal();
-    }
-    IMP orig = gOrigPerformWork;
-    if ([NSStringFromClass([self class]) isEqualToString:@"OKMBatchReadLogTask"] && gOrigBatchPerformWork) {
-        orig = gOrigBatchPerformWork;
-    }
-    if (orig) return ((id (*)(id, SEL))orig)(self, _cmd);
-    return nil;
-}
-
-static void mvibe_perform(id self, SEL _cmd) {
-    if (MVShouldBlockReadTask(self)) {
-        MVGLog(@"perform skip %@", NSStringFromClass([self class]));
-        return;
-    }
-    if (gOrigPerform) ((void (*)(id, SEL))gOrigPerform)(self, _cmd);
-}
-
 static void mvibe_enqueueTask(id self, SEL _cmd, id task) {
     if (MVShouldBlockReadTask(task)) {
         MVGLog(@"enqueueTask drop %@", NSStringFromClass([task class]));
@@ -261,7 +228,7 @@ static void mvibe_setInteractive(id self, SEL _cmd, BOOL interactive) {
     if (gOrigSetInteractive) ((void (*)(id, SEL, BOOL))gOrigSetInteractive)(self, _cmd, interactive);
 }
 
-#pragma mark - VPN (named classes only)
+#pragma mark - VPN
 
 static BOOL mvibe_isVPNDetected(id self, SEL _cmd) {
     if (MaxVibeHideVpnEnabled()) return NO;
@@ -302,23 +269,80 @@ static void mvibe_presentCallVPN(id self, SEL _cmd) {
     IMP orig = MVLoadOrig(self, _cmd);
     if (orig) ((void (*)(id, SEL))orig)(self, _cmd);
 }
-
-static unsigned MVHookNamed(const char *const *names, SEL sel, IMP replacement, NSString *tag) {
-    unsigned hooked = 0;
-    for (const char *const *p = names; p && *p; p++) {
-        Class cls = objc_getClass(*p);
-        if (!cls) continue;
-        Method m = MVOwnMethod(cls, sel);
-        if (!m) continue;
-        IMP orig = method_getImplementation(m);
-        if (orig == replacement) continue;
-        MVSaveOrig(cls, sel, orig);
-        method_setImplementation(m, replacement);
-        hooked++;
-        MVGLog(@"%@: OK %@", tag, NSStringFromClass(cls));
+static void mvibe_vpnEnabledCompletion(id self, SEL _cmd, id completion) {
+    if (MaxVibeHideVpnEnabled()) {
+        if (completion) {
+            @try { ((void (^)(BOOL))completion)(NO); } @catch (__unused NSException *ex) {}
+        }
+        return;
     }
-    if (!hooked) MVGLog(@"%@: no named class", tag);
-    return hooked;
+    IMP orig = MVLoadOrig(self, _cmd);
+    if (orig) ((void (*)(id, SEL, id))orig)(self, _cmd, completion);
+}
+
+static BOOL MVClassLooksLikeAppVPN(Class cls) {
+    if (!cls) return NO;
+    const char *n = class_getName(cls);
+    if (!n) return NO;
+    if (strstr(n, "NEVPN") || strstr(n, "NWTLS") || strstr(n, "NetworkExtension")) return NO;
+    return strstr(n, "VPNRestriction") || strstr(n, "OMVPN") || strstr(n, "VPNWarning");
+}
+
+static unsigned MVHookSelOnClass(Class cls, SEL sel, IMP replacement, NSString *tag) {
+    Method m = MVOwnMethod(cls, sel);
+    if (!m) return 0;
+    IMP orig = method_getImplementation(m);
+    if (orig == replacement) return 0;
+    MVSaveOrig(cls, sel, orig);
+    method_setImplementation(m, replacement);
+    MVGLog(@"%@: OK %@", tag, NSStringFromClass(cls));
+    return 1;
+}
+
+static void MVHookVPNSelsOnClass(Class cls) {
+    MVHookSelOnClass(cls, NSSelectorFromString(@"isVPNDetected"), (IMP)mvibe_isVPNDetected, @"isVPNDetected");
+    MVHookSelOnClass(cls, NSSelectorFromString(@"isVPNEnabled"), (IMP)mvibe_isVPNEnabled, @"isVPNEnabled");
+    MVHookSelOnClass(cls, NSSelectorFromString(@"setIsVPNDetected:"), (IMP)mvibe_setVPNDetected, @"setIsVPNDetected");
+    MVHookSelOnClass(cls, NSSelectorFromString(@"shouldIgnoreVPNRestriction"), (IMP)mvibe_ignoreVPN, @"shouldIgnoreVPNRestriction");
+    MVHookSelOnClass(cls, NSSelectorFromString(@"presentVPNRestrictionWithRestrictedAction:"), (IMP)mvibe_presentVPN, @"presentVPNRestriction");
+    MVHookSelOnClass(cls, NSSelectorFromString(@"presentCallVPNRestrictionIfNeeded"), (IMP)mvibe_presentCallVPN, @"presentCallVPN");
+    MVHookSelOnClass(cls, NSSelectorFromString(@"isVPNEnabledWithCompletion:"), (IMP)mvibe_vpnEnabledCompletion, @"isVPNEnabledWithCompletion");
+}
+
+static BOOL MVIsVPNRestrictionController(id vc) {
+    if (!vc) return NO;
+    NSString *n = NSStringFromClass([vc class]);
+    return [n containsString:@"VPNRestriction"];
+}
+
+static void mvibe_presentVC(id self, SEL _cmd, id vc, BOOL animated, id completion) {
+    if (MaxVibeHideVpnEnabled() && MVIsVPNRestrictionController(vc)) {
+        MVGLog(@"suppress presentViewController %@", NSStringFromClass([vc class]));
+        if (completion) {
+            @try { ((void (^)(void))completion)(); } @catch (__unused NSException *ex) {}
+        }
+        return;
+    }
+    if (gOrigPresentVC) ((void (*)(id, SEL, id, BOOL, id))gOrigPresentVC)(self, _cmd, vc, animated, completion);
+}
+
+static void mvibe_showVC(id self, SEL _cmd, id vc, id sender) {
+    if (MaxVibeHideVpnEnabled() && MVIsVPNRestrictionController(vc)) {
+        MVGLog(@"suppress showViewController %@", NSStringFromClass([vc class]));
+        return;
+    }
+    if (gOrigShowVC) ((void (*)(id, SEL, id, id))gOrigShowVC)(self, _cmd, vc, sender);
+}
+
+static void MVInstallVPNPresentHooks(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        Class vc = [UIViewController class];
+        MVHookOwn(vc, @selector(presentViewController:animated:completion:),
+                  (IMP)mvibe_presentVC, &gOrigPresentVC, @"presentViewController");
+        MVHookOwn(vc, @selector(showViewController:sender:),
+                  (IMP)mvibe_showVC, &gOrigShowVC, @"showViewController");
+    });
 }
 
 static void MVInstallVPNHooks(void) {
@@ -333,18 +357,25 @@ static void MVInstallVPNHooks(void) {
         "VPNRestrictionBuilder",
         NULL
     };
-    MVHookNamed(kVPNClasses, NSSelectorFromString(@"isVPNDetected"),
-                (IMP)mvibe_isVPNDetected, @"isVPNDetected");
-    MVHookNamed(kVPNClasses, NSSelectorFromString(@"isVPNEnabled"),
-                (IMP)mvibe_isVPNEnabled, @"isVPNEnabled");
-    MVHookNamed(kVPNClasses, NSSelectorFromString(@"setIsVPNDetected:"),
-                (IMP)mvibe_setVPNDetected, @"setIsVPNDetected");
-    MVHookNamed(kVPNClasses, NSSelectorFromString(@"shouldIgnoreVPNRestriction"),
-                (IMP)mvibe_ignoreVPN, @"shouldIgnoreVPNRestriction");
-    MVHookNamed(kVPNClasses, NSSelectorFromString(@"presentVPNRestrictionWithRestrictedAction:"),
-                (IMP)mvibe_presentVPN, @"presentVPNRestriction");
-    MVHookNamed(kVPNClasses, NSSelectorFromString(@"presentCallVPNRestrictionIfNeeded"),
-                (IMP)mvibe_presentCallVPN, @"presentCallVPN");
+    for (const char *const *p = kVPNClasses; p && *p; p++) {
+        Class cls = objc_getClass(*p);
+        if (cls) MVHookVPNSelsOnClass(cls);
+    }
+    unsigned n = 0;
+    Class *list = objc_copyClassList(&n);
+    unsigned extra = 0;
+    for (unsigned i = 0; i < n; i++) {
+        if (!MVClassLooksLikeAppVPN(list[i])) continue;
+        MVHookVPNSelsOnClass(list[i]);
+        extra++;
+    }
+    if (list) free(list);
+    MVGLog(@"VPN class-filter matched %u", extra);
+    MVInstallVPNPresentHooks();
+}
+
+void MaxVibeRefreshVPNHooks(void) {
+    MVInstallVPNHooks();
 }
 
 #pragma mark - Install
@@ -368,14 +399,6 @@ void MaxVibeInstallGhost(void) {
         MVHookOwn(typingSvc, NSSelectorFromString(@"sendTypingNotificationIfNeeded:"),
                   (IMP)mvibe_sendTypingNotif, &gOrigSendTypingNotif, @"sendTypingNotificationIfNeeded");
 
-        Class baseTask = NSClassFromString(@"OKMBaseTask");
-        MVHookOwn(baseTask, NSSelectorFromString(@"performWorkSignal"),
-                  (IMP)mvibe_performWork, &gOrigPerformWork, @"OKMBaseTask performWorkSignal");
-        MVHookOwn(baseTask, NSSelectorFromString(@"perform"),
-                  (IMP)mvibe_perform, &gOrigPerform, @"OKMBaseTask perform");
-        Class batchRead = NSClassFromString(@"OKMBatchReadLogTask");
-        MVHookOwn(batchRead, NSSelectorFromString(@"performWorkSignal"),
-                  (IMP)mvibe_performWork, &gOrigBatchPerformWork, @"OKMBatchReadLogTask performWorkSignal");
         Class tasks = NSClassFromString(@"OKMTasksService");
         MVHookOwn(tasks, NSSelectorFromString(@"enqueueTask:"),
                   (IMP)mvibe_enqueueTask, &gOrigEnqueueTask, @"enqueueTask");
@@ -390,6 +413,6 @@ void MaxVibeInstallGhost(void) {
 
         MVInstallVPNHooks();
 
-        MVGLog(@"install done (no sendData, no enqueueTasks batch filter, no class-list VPN)");
+        MVGLog(@"install done (no BaseTask perform, no sendData)");
     });
 }
