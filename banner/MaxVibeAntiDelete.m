@@ -28,6 +28,7 @@ static const NSInteger kStatusEditedDefault = 9;
 static NSNumber *gMyUserId = nil;
 static NSMutableSet *gDeletedPks = nil;
 static NSMutableDictionary *gTextCache = nil;
+static NSLock *gCacheLock = nil;
 static NSInteger gPreferredLiveStatus = 0;
 static NSInteger gRemovedStatus = kStatusRemovedDefault;
 static NSInteger gEditedStatus = kStatusEditedDefault;
@@ -91,33 +92,57 @@ static void MVEnsureStore(void) {
     dispatch_once(&once, ^{
         gDeletedPks = [NSMutableSet set];
         gTextCache = [NSMutableDictionary dictionary];
+        gCacheLock = [[NSLock alloc] init];
         NSUserDefaults *p = [NSUserDefaults standardUserDefaults];
         NSArray *saved = [p arrayForKey:kDeletedPksKey];
         if ([saved isKindOfClass:[NSArray class]]) [gDeletedPks addObjectsFromArray:saved];
         NSDictionary *texts = [p dictionaryForKey:kTextCacheKey];
-        if ([texts isKindOfClass:[NSDictionary class]]) [gTextCache addEntriesFromDictionary:texts];
+        if ([texts isKindOfClass:[NSDictionary class]]) {
+            [texts enumerateKeysAndObjectsUsingBlock:^(id key, id obj, BOOL *stop) {
+                if ([key isKindOfClass:[NSString class]] && [obj isKindOfClass:[NSString class]]) {
+                    gTextCache[key] = obj;
+                }
+            }];
+        }
         id uid = [p objectForKey:kMyUserIdKey];
         if ([uid isKindOfClass:[NSNumber class]]) gMyUserId = uid;
     });
 }
 
 static void MVPersistDeletedPks(void) {
-    [[NSUserDefaults standardUserDefaults] setObject:gDeletedPks.allObjects forKey:kDeletedPksKey];
+    NSArray *snap = nil;
+    [gCacheLock lock];
+    snap = gDeletedPks.allObjects;
+    [gCacheLock unlock];
+    [[NSUserDefaults standardUserDefaults] setObject:snap forKey:kDeletedPksKey];
 }
 
 static void MVPersistTextCache(void) {
-    // Never drop texts for known deleted messages — that caused "❌" with no body after hours.
+    MVEnsureStore();
+    NSMutableDictionary *plist = [NSMutableDictionary dictionary];
+    [gCacheLock lock];
     if (gTextCache.count > 800) {
         NSArray *keys = gTextCache.allKeys;
         NSUInteger removed = 0;
-        for (NSString *k in keys) {
+        for (id k in keys) {
             if (removed >= 200) break;
+            if (![k isKindOfClass:[NSString class]]) {
+                [gTextCache removeObjectForKey:k];
+                removed++;
+                continue;
+            }
             if ([gDeletedPks containsObject:k]) continue;
             [gTextCache removeObjectForKey:k];
             removed++;
         }
     }
-    [[NSUserDefaults standardUserDefaults] setObject:gTextCache forKey:kTextCacheKey];
+    [gTextCache enumerateKeysAndObjectsUsingBlock:^(id key, id obj, BOOL *stop) {
+        if ([key isKindOfClass:[NSString class]] && [obj isKindOfClass:[NSString class]]) {
+            plist[key] = obj;
+        }
+    }];
+    [gCacheLock unlock];
+    [[NSUserDefaults standardUserDefaults] setObject:plist forKey:kTextCacheKey];
 }
 
 static void MVRememberMyUserId(NSNumber *uid) {
@@ -166,41 +191,50 @@ static NSArray<NSString *> *MVStableKeysForMessage(id msg) {
 }
 
 static BOOL MVDeletedKnownForMessage(id msg) {
+    MVEnsureStore();
+    [gCacheLock lock];
+    BOOL known = NO;
     for (NSString *k in MVStableKeysForMessage(msg)) {
-        if ([gDeletedPks containsObject:k]) return YES;
+        if ([gDeletedPks containsObject:k]) { known = YES; break; }
     }
-    return NO;
+    [gCacheLock unlock];
+    return known;
 }
 
 /** Prefer longest non-empty original body (markers stripped). */
 static NSString *MVCachedOriginalForMessage(id msg) {
     NSString *best = @"";
+    [gCacheLock lock];
     for (NSString *k in MVStableKeysForMessage(msg)) {
         NSString *v = gTextCache[k];
         if (![v isKindOfClass:[NSString class]]) continue;
         NSString *plain = MVStripMarkers(v);
         if (plain.length > best.length) best = plain;
     }
+    [gCacheLock unlock];
     return best.length ? best : nil;
 }
 
 /** Store only original body. Never overwrite a good original with empty / marker-only. */
-static void MVStoreOriginalText(id msg, NSString *text) {
+static void MVStoreOriginalText(id msg, NSString *text, BOOL persist) {
+    MVEnsureStore();
     NSString *plain = MVStripMarkers(text ?: @"");
     if (!plain.length) return;
+    [gCacheLock lock];
     for (NSString *k in MVStableKeysForMessage(msg)) {
         if (!k.length) continue;
         NSString *prev = MVStripMarkers(gTextCache[k] ?: @"");
         if (prev.length && prev.length >= plain.length) continue;
         gTextCache[k] = plain;
     }
-    MVPersistTextCache();
+    [gCacheLock unlock];
+    if (persist) MVPersistTextCache();
 }
 
 static void MVRememberDeletedAndText(id msg, NSString *originalOrTagged) {
     NSString *plain = MVStripMarkers(originalOrTagged ?: @"");
-    // Keep previous original if new one is empty (re-delete hours later with blank body).
     if (!plain.length) plain = MVCachedOriginalForMessage(msg) ?: @"";
+    [gCacheLock lock];
     for (NSString *k in MVStableKeysForMessage(msg)) {
         if (k.length) [gDeletedPks addObject:k];
         if (k.length && plain.length) {
@@ -208,6 +242,7 @@ static void MVRememberDeletedAndText(id msg, NSString *originalOrTagged) {
             if (!prev.length || plain.length >= prev.length) gTextCache[k] = plain;
         }
     }
+    [gCacheLock unlock];
     MVPersistDeletedPks();
     MVPersistTextCache();
 }
@@ -365,7 +400,7 @@ static void MVCacheLiveMessage(id msg) {
     if ([text containsString:kDbMarker] || [text hasPrefix:kPrefix]) return;
     if (st != -999 && !MVIsRemovedStatus(st) && st != gEditedStatus)
         gPreferredLiveStatus = st;
-    MVStoreOriginalText(msg, text);
+    MVStoreOriginalText(msg, text, YES);
 }
 
 static void MVTagMessageText(id msg) {
@@ -397,6 +432,7 @@ static BOOL MVShouldRenderTagged(id msg) {
 }
 
 static id MVRenderTaggedValue(id msg, id originalValue) {
+    if (!MaxVibeAntiDeleteEnabled()) return originalValue;
     if (!MVShouldRenderTagged(msg)) return originalValue;
     NSString *cached = MVCachedOriginalForMessage(msg);
     if ([originalValue isKindOfClass:[NSString class]]) {
@@ -433,8 +469,7 @@ static void MVCacheTextFromRenderedValue(id msg, id value) {
     }
     text = MVStripMarkers(text ?: @"");
     if (!text.length) return;
-    // Even for known-deleted: recover/refresh original if we see real body again.
-    MVStoreOriginalText(msg, text);
+    MVStoreOriginalText(msg, text, NO);
 }
 
 static void MVConvertIncomingDelete(id msg) {

@@ -127,10 +127,6 @@ static char kMvibeSettingsRowKey;
     MaxVibeInstallGhost();
     MaxVibeRefreshVPNHooks();
     [self installSettingsHooks];
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        MaxVibeStripVPNRestrictionUI();
-    });
 
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kInitialDelay * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{

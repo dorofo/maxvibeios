@@ -362,15 +362,6 @@ static void MVHookVPNSelsOnClass(Class cls) {
     Method rest = MVOwnMethod(cls, NSSelectorFromString(@"isRestricted"));
     if (rest && method_getNumberOfArguments(rest) == 2) {
         MVHookSelOnClass(cls, NSSelectorFromString(@"isRestricted"), (IMP)mvibe_isRestricted, @"isRestricted");
-    } else {
-        Method inh = class_getInstanceMethod(cls, NSSelectorFromString(@"isRestricted"));
-        if (inh && method_getNumberOfArguments(inh) == 2 && !MVOwnMethod(cls, NSSelectorFromString(@"isRestricted"))) {
-            MVSaveOrig(cls, NSSelectorFromString(@"isRestricted"), method_getImplementation(inh));
-            const char *enc = method_getTypeEncoding(inh);
-            if (class_addMethod(cls, NSSelectorFromString(@"isRestricted"), (IMP)mvibe_isRestricted, enc ? enc : "B@:")) {
-                MVGLog(@"isRestricted: subclass override %@", NSStringFromClass(cls));
-            }
-        }
     }
     Method rest1 = MVOwnMethod(cls, NSSelectorFromString(@"isRestricted:"));
     if (rest1) {
