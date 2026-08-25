@@ -8,15 +8,12 @@
 /*
  * MaxVibe privacy toggles (default OFF, runtime flag is source of truth).
  *
- * hide-read    — drop OKMReadMarkTask via enqueueTask: only
- *                (never hook OKMBaseTask perform / performWorkSignal — that crashed
- *                reply send with -[x takeUntil:])
+ * hide-read    — subclass-only override of OKMReadMarkTask perform (do NOT enqueue-drop)
  * hide-typing  — no-op typing sender start/timer + TypingService userDidType
  * hide-online  — force ping interactive=NO on OKMMessengerClient (Android tgc)
- * hide-vpn     — VPNRestriction/OMVPN classes + block present of that VC
+ * hide-vpn     — isRestricted=NO + shouldIgnore + do not present restriction UI
  *
- * Never hook sendData: (ABI / MSG_SEND reply link).
- * Never hook OKMBaseTask perform / performWorkSignal (reply crash: takeUntil:).
+ * Never hook sendData: / OKMBaseTask perform (reply crash + lost reply link).
  * Never hook serializeBlock (sticker panel).
  */
 
@@ -149,7 +146,10 @@ static IMP gOrigSendTypingNotif = NULL;
 static IMP gOrigPingInteractive = NULL;
 static IMP gOrigSendPingIfNeeded = NULL;
 static IMP gOrigSetInteractive = NULL;
-static IMP gOrigEnqueueTask = NULL;
+static IMP gOrigRMPerform = NULL;
+static IMP gOrigRMWork = NULL;
+static IMP gOrigBRPerform = NULL;
+static IMP gOrigBRWork = NULL;
 static IMP gOrigPresentVC = NULL;
 static IMP gOrigShowVC = NULL;
 static NSMutableDictionary *gOrigByKey = nil;
@@ -193,18 +193,53 @@ static void mvibe_sendTypingNotif(id self, SEL _cmd, id arg) {
     if (gOrigSendTypingNotif) ((void (*)(id, SEL, id))gOrigSendTypingNotif)(self, _cmd, arg);
 }
 
-#pragma mark - Read
+#pragma mark - Read (subclass override only — never touch enqueue or BaseTask)
 
 static BOOL MVShouldBlockReadTask(id task) {
     return MaxVibeHideReadEnabled() && MVIsReadTask(task) && !MVReadTaskIsUnreadMark(task);
 }
 
-static void mvibe_enqueueTask(id self, SEL _cmd, id task) {
-    if (MVShouldBlockReadTask(task)) {
-        MVGLog(@"enqueueTask drop %@", NSStringFromClass([task class]));
-        return;
+static BOOL MVAddSubclassHook(Class cls, SEL sel, IMP imp, IMP *origOut, NSString *tag) {
+    if (!cls || !sel) return NO;
+    Method own = MVOwnMethod(cls, sel);
+    if (own) {
+        if (origOut) *origOut = method_getImplementation(own);
+        method_setImplementation(own, imp);
+        MVGLog(@"%@: own %@", tag, NSStringFromClass(cls));
+        return YES;
     }
-    if (gOrigEnqueueTask) ((void (*)(id, SEL, id))gOrigEnqueueTask)(self, _cmd, task);
+    Method inherited = class_getInstanceMethod(cls, sel);
+    if (!inherited) {
+        MVGLog(@"%@: no method %@", tag, NSStringFromClass(cls));
+        return NO;
+    }
+    if (origOut) *origOut = method_getImplementation(inherited);
+    const char *enc = method_getTypeEncoding(inherited);
+    if (class_addMethod(cls, sel, imp, enc ? enc : "v@:")) {
+        MVGLog(@"%@: subclass override %@", tag, NSStringFromClass(cls));
+        return YES;
+    }
+    MVGLog(@"%@: addMethod failed %@", tag, NSStringFromClass(cls));
+    return NO;
+}
+
+static void mvibe_rmPerform(id self, SEL _cmd) {
+    if (MVShouldBlockReadTask(self)) return;
+    if (gOrigRMPerform) ((void (*)(id, SEL))gOrigRMPerform)(self, _cmd);
+}
+static id mvibe_rmWork(id self, SEL _cmd) {
+    if (MVShouldBlockReadTask(self)) return nil;
+    if (gOrigRMWork) return ((id (*)(id, SEL))gOrigRMWork)(self, _cmd);
+    return nil;
+}
+static void mvibe_brPerform(id self, SEL _cmd) {
+    if (MVShouldBlockReadTask(self)) return;
+    if (gOrigBRPerform) ((void (*)(id, SEL))gOrigBRPerform)(self, _cmd);
+}
+static id mvibe_brWork(id self, SEL _cmd) {
+    if (MVShouldBlockReadTask(self)) return nil;
+    if (gOrigBRWork) return ((id (*)(id, SEL))gOrigBRWork)(self, _cmd);
+    return nil;
 }
 
 #pragma mark - Online / ping
@@ -243,6 +278,23 @@ static BOOL mvibe_isVPNEnabled(id self, SEL _cmd) {
     return NO;
 }
 static void mvibe_setVPNDetected(id self, SEL _cmd, BOOL on) {
+    if (MaxVibeHideVpnEnabled()) on = NO;
+    IMP orig = MVLoadOrig(self, _cmd);
+    if (orig) ((void (*)(id, SEL, BOOL))orig)(self, _cmd, on);
+}
+static BOOL mvibe_isRestricted(id self, SEL _cmd) {
+    if (MaxVibeHideVpnEnabled()) return NO;
+    IMP orig = MVLoadOrig(self, _cmd);
+    if (orig) return ((BOOL (*)(id, SEL))orig)(self, _cmd);
+    return NO;
+}
+static BOOL mvibe_isRestricted1(id self, SEL _cmd, long long action) {
+    if (MaxVibeHideVpnEnabled()) return NO;
+    IMP orig = MVLoadOrig(self, _cmd);
+    if (orig) return ((BOOL (*)(id, SEL, long long))orig)(self, _cmd, action);
+    return NO;
+}
+static void mvibe_setRestricted(id self, SEL _cmd, BOOL on) {
     if (MaxVibeHideVpnEnabled()) on = NO;
     IMP orig = MVLoadOrig(self, _cmd);
     if (orig) ((void (*)(id, SEL, BOOL))orig)(self, _cmd, on);
@@ -307,6 +359,25 @@ static void MVHookVPNSelsOnClass(Class cls) {
     MVHookSelOnClass(cls, NSSelectorFromString(@"presentVPNRestrictionWithRestrictedAction:"), (IMP)mvibe_presentVPN, @"presentVPNRestriction");
     MVHookSelOnClass(cls, NSSelectorFromString(@"presentCallVPNRestrictionIfNeeded"), (IMP)mvibe_presentCallVPN, @"presentCallVPN");
     MVHookSelOnClass(cls, NSSelectorFromString(@"isVPNEnabledWithCompletion:"), (IMP)mvibe_vpnEnabledCompletion, @"isVPNEnabledWithCompletion");
+    Method rest = MVOwnMethod(cls, NSSelectorFromString(@"isRestricted"));
+    if (rest && method_getNumberOfArguments(rest) == 2) {
+        MVHookSelOnClass(cls, NSSelectorFromString(@"isRestricted"), (IMP)mvibe_isRestricted, @"isRestricted");
+    } else {
+        Method inh = class_getInstanceMethod(cls, NSSelectorFromString(@"isRestricted"));
+        if (inh && method_getNumberOfArguments(inh) == 2 && !MVOwnMethod(cls, NSSelectorFromString(@"isRestricted"))) {
+            MVSaveOrig(cls, NSSelectorFromString(@"isRestricted"), method_getImplementation(inh));
+            const char *enc = method_getTypeEncoding(inh);
+            if (class_addMethod(cls, NSSelectorFromString(@"isRestricted"), (IMP)mvibe_isRestricted, enc ? enc : "B@:")) {
+                MVGLog(@"isRestricted: subclass override %@", NSStringFromClass(cls));
+            }
+        }
+    }
+    Method rest1 = MVOwnMethod(cls, NSSelectorFromString(@"isRestricted:"));
+    if (rest1) {
+        MVHookSelOnClass(cls, NSSelectorFromString(@"isRestricted:"), (IMP)mvibe_isRestricted1, @"isRestricted:");
+    }
+    MVHookSelOnClass(cls, NSSelectorFromString(@"setIsRestricted:"), (IMP)mvibe_setRestricted, @"setIsRestricted");
+    MVHookSelOnClass(cls, NSSelectorFromString(@"setRestricted:"), (IMP)mvibe_setRestricted, @"setRestricted");
 }
 
 static BOOL MVIsVPNRestrictionController(id vc) {
@@ -399,9 +470,16 @@ void MaxVibeInstallGhost(void) {
         MVHookOwn(typingSvc, NSSelectorFromString(@"sendTypingNotificationIfNeeded:"),
                   (IMP)mvibe_sendTypingNotif, &gOrigSendTypingNotif, @"sendTypingNotificationIfNeeded");
 
-        Class tasks = NSClassFromString(@"OKMTasksService");
-        MVHookOwn(tasks, NSSelectorFromString(@"enqueueTask:"),
-                  (IMP)mvibe_enqueueTask, &gOrigEnqueueTask, @"enqueueTask");
+        Class readMark = NSClassFromString(@"OKMReadMarkTask");
+        MVAddSubclassHook(readMark, NSSelectorFromString(@"perform"),
+                          (IMP)mvibe_rmPerform, &gOrigRMPerform, @"ReadMark perform");
+        MVAddSubclassHook(readMark, NSSelectorFromString(@"performWorkSignal"),
+                          (IMP)mvibe_rmWork, &gOrigRMWork, @"ReadMark performWorkSignal");
+        Class batchRead = NSClassFromString(@"OKMBatchReadLogTask");
+        MVAddSubclassHook(batchRead, NSSelectorFromString(@"perform"),
+                          (IMP)mvibe_brPerform, &gOrigBRPerform, @"BatchRead perform");
+        MVAddSubclassHook(batchRead, NSSelectorFromString(@"performWorkSignal"),
+                          (IMP)mvibe_brWork, &gOrigBRWork, @"BatchRead performWorkSignal");
 
         Class client = NSClassFromString(@"OKMMessengerClient");
         MVHookOwn(client, NSSelectorFromString(@"_reschedulePingTimerWithForInteractive:"),
