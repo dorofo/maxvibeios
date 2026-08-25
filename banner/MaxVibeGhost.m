@@ -7,8 +7,8 @@
 /*
  * MaxVibe privacy toggles (default OFF, runtime flag is source of truth).
  *
- * hide-read    — no-op OKMReadMarkTask / OKMBatchReadLogTask performWorkSignal
- *                (do NOT drop tasks from enqueue — that broke reply-to-message)
+ * hide-read    — drop single enqueueTask: of OKMReadMarkTask + no-op performWork
+ *                (do NOT filter enqueueTasks:withDependencies: — that broke replies)
  * hide-typing  — no-op typing sender start/timer + TypingService userDidType
  * hide-online  — force ping interactive=NO on OKMMessengerClient (Android tgc)
  * hide-vpn     — named VPN classes only (no objc_copyClassList, no delayed walk)
@@ -131,22 +131,22 @@ static id MVEmptySignal(void) {
 static BOOL MVIsReadTask(id task) {
     if (!task) return NO;
     NSString *cls = NSStringFromClass([task class]);
-    return [cls isEqualToString:@"OKMReadMarkTask"] || [cls isEqualToString:@"OKMBatchReadLogTask"];
+    return [cls hasSuffix:@"ReadMarkTask"] || [cls isEqualToString:@"OKMBatchReadLogTask"];
 }
 
-/** Android allows SET_AS_UNREAD through ghost; keep the same here. */
+/** Android allows SET_AS_UNREAD through ghost. Do NOT treat an unread-count as that flag. */
 static BOOL MVReadTaskIsUnreadMark(id task) {
     if (!task) return NO;
     @try {
-        id flagged = nil;
-        for (NSString *key in @[@"markedAsUnread", @"setAsUnread", @"isUnread", @"unread"]) {
-            flagged = [task valueForKey:key];
+        for (NSString *key in @[@"markedAsUnread", @"setAsUnread"]) {
+            id flagged = [task valueForKey:key];
             if ([flagged respondsToSelector:@selector(boolValue)] && [flagged boolValue]) return YES;
         }
         id mt = [task valueForKey:@"markType"];
         if (!mt) return NO;
         NSString *s = [[mt description] uppercaseString];
-        if ([s containsString:@"UNREAD"] && ![s containsString:@"READ_MESSAGE"]) return YES;
+        if ([s containsString:@"SET_AS_UNREAD"]) return YES;
+        if ([s isEqualToString:@"UNREAD"] || [s isEqualToString:@"MARK_AS_UNREAD"]) return YES;
     } @catch (__unused NSException *ex) {}
     return NO;
 }
@@ -162,6 +162,8 @@ static IMP gOrigSendPingIfNeeded = NULL;
 static IMP gOrigSetInteractive = NULL;
 static IMP gOrigPerformWork = NULL;
 static IMP gOrigBatchPerformWork = NULL;
+static IMP gOrigPerform = NULL;
+static IMP gOrigEnqueueTask = NULL;
 static NSMutableDictionary *gOrigByKey = nil;
 
 static NSString *MVOrigKey(Class cls, SEL sel) {
@@ -203,10 +205,15 @@ static void mvibe_sendTypingNotif(id self, SEL _cmd, id arg) {
     if (gOrigSendTypingNotif) ((void (*)(id, SEL, id))gOrigSendTypingNotif)(self, _cmd, arg);
 }
 
-#pragma mark - Read (performWork only — keep enqueue intact)
+#pragma mark - Read
+
+static BOOL MVShouldBlockReadTask(id task) {
+    return MaxVibeHideReadEnabled() && MVIsReadTask(task) && !MVReadTaskIsUnreadMark(task);
+}
 
 static id mvibe_performWork(id self, SEL _cmd) {
-    if (MaxVibeHideReadEnabled() && MVIsReadTask(self) && !MVReadTaskIsUnreadMark(self)) {
+    if (MVShouldBlockReadTask(self)) {
+        MVGLog(@"performWorkSignal skip %@", NSStringFromClass([self class]));
         return MVEmptySignal();
     }
     IMP orig = gOrigPerformWork;
@@ -215,6 +222,22 @@ static id mvibe_performWork(id self, SEL _cmd) {
     }
     if (orig) return ((id (*)(id, SEL))orig)(self, _cmd);
     return nil;
+}
+
+static void mvibe_perform(id self, SEL _cmd) {
+    if (MVShouldBlockReadTask(self)) {
+        MVGLog(@"perform skip %@", NSStringFromClass([self class]));
+        return;
+    }
+    if (gOrigPerform) ((void (*)(id, SEL))gOrigPerform)(self, _cmd);
+}
+
+static void mvibe_enqueueTask(id self, SEL _cmd, id task) {
+    if (MVShouldBlockReadTask(task)) {
+        MVGLog(@"enqueueTask drop %@", NSStringFromClass([task class]));
+        return;
+    }
+    if (gOrigEnqueueTask) ((void (*)(id, SEL, id))gOrigEnqueueTask)(self, _cmd, task);
 }
 
 #pragma mark - Online / ping
@@ -348,9 +371,14 @@ void MaxVibeInstallGhost(void) {
         Class baseTask = NSClassFromString(@"OKMBaseTask");
         MVHookOwn(baseTask, NSSelectorFromString(@"performWorkSignal"),
                   (IMP)mvibe_performWork, &gOrigPerformWork, @"OKMBaseTask performWorkSignal");
+        MVHookOwn(baseTask, NSSelectorFromString(@"perform"),
+                  (IMP)mvibe_perform, &gOrigPerform, @"OKMBaseTask perform");
         Class batchRead = NSClassFromString(@"OKMBatchReadLogTask");
         MVHookOwn(batchRead, NSSelectorFromString(@"performWorkSignal"),
                   (IMP)mvibe_performWork, &gOrigBatchPerformWork, @"OKMBatchReadLogTask performWorkSignal");
+        Class tasks = NSClassFromString(@"OKMTasksService");
+        MVHookOwn(tasks, NSSelectorFromString(@"enqueueTask:"),
+                  (IMP)mvibe_enqueueTask, &gOrigEnqueueTask, @"enqueueTask");
 
         Class client = NSClassFromString(@"OKMMessengerClient");
         MVHookOwn(client, NSSelectorFromString(@"_reschedulePingTimerWithForInteractive:"),
@@ -362,6 +390,6 @@ void MaxVibeInstallGhost(void) {
 
         MVInstallVPNHooks();
 
-        MVGLog(@"install done (no sendData, no enqueue, no class-list VPN)");
+        MVGLog(@"install done (no sendData, no enqueueTasks batch filter, no class-list VPN)");
     });
 }

@@ -1,6 +1,8 @@
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
+#import <objc/message.h>
+#import <notify.h>
 #import "MaxVibeAntiDelete.h"
 #import "MaxVibeGhost.h"
 
@@ -550,6 +552,67 @@ static char kMvibeSettingsRowKey;
     return @"Нужен iOS 10.3+";
 }
 
+- (NSString *)homeScreenNameForIcon:(NSString *)iconName {
+    if ([iconName isEqualToString:@"MaxOriginal"]) return @"MAX";
+    return @"MaxVibe";
+}
+
+- (BOOL)writePlistFile:(NSString *)path setName:(NSString *)name {
+    if (!path.length || ![[NSFileManager defaultManager] fileExistsAtPath:path]) return NO;
+    NSData *data = [NSData dataWithContentsOfFile:path];
+    if (!data.length) return NO;
+    NSError *err = nil;
+    NSPropertyListFormat fmt = NSPropertyListBinaryFormat_v1_0;
+    id obj = [NSPropertyListSerialization propertyListWithData:data
+                                                       options:NSPropertyListMutableContainersAndLeaves
+                                                        format:&fmt
+                                                         error:&err];
+    if (![obj isKindOfClass:[NSMutableDictionary class]]) return NO;
+    NSMutableDictionary *dict = obj;
+    dict[@"CFBundleDisplayName"] = name;
+    dict[@"CFBundleName"] = name;
+    id alts = dict[@"INAlternativeAppNames"];
+    if ([alts isKindOfClass:[NSArray class]] && [(NSArray *)alts count]) {
+        dict[@"INAlternativeAppNames"] = @[@{@"INAlternativeAppName": name}];
+    }
+    NSData *out = [NSPropertyListSerialization dataWithPropertyList:dict format:fmt options:0 error:&err];
+    if (!out.length) return NO;
+    return [out writeToFile:path atomically:YES];
+}
+
+- (void)refreshSpringBoardName {
+    @try {
+        notify_post("com.apple.LaunchServices.databaseUpdated");
+        notify_post("com.apple.mobile.application_installed");
+        Class ls = NSClassFromString(@"LSApplicationWorkspace");
+        SEL defSel = NSSelectorFromString(@"defaultWorkspace");
+        if (!ls || ![ls respondsToSelector:defSel]) return;
+        id ws = ((id (*)(id, SEL))objc_msgSend)(ls, defSel);
+        if (!ws) return;
+        NSURL *url = [NSBundle mainBundle].bundleURL;
+        SEL inv = NSSelectorFromString(@"invalidateIconCache:");
+        if ([ws respondsToSelector:inv]) {
+            ((void (*)(id, SEL, id))objc_msgSend)(ws, inv, nil);
+        }
+        SEL recache = NSSelectorFromString(@"registerApplication:");
+        if ([ws respondsToSelector:recache]) {
+            ((BOOL (*)(id, SEL, id))objc_msgSend)(ws, recache, url);
+        }
+    } @catch (__unused NSException *ex) {}
+}
+
+- (void)applyHomeScreenNameForIcon:(NSString *)iconName {
+    NSString *label = [self homeScreenNameForIcon:iconName];
+    NSString *bundle = [NSBundle mainBundle].bundlePath;
+    [self writePlistFile:[bundle stringByAppendingPathComponent:@"Info.plist"] setName:label];
+    for (NSString *loc in @[@"en.lproj", @"ru.lproj"]) {
+        NSString *path = [[bundle stringByAppendingPathComponent:loc] stringByAppendingPathComponent:@"InfoPlist.strings"];
+        [self writePlistFile:path setName:label];
+    }
+    [self refreshSpringBoardName];
+    NSLog(@"[MaxVibe] home screen name -> %@", label);
+}
+
 - (void)applyAlternateIcon:(NSString *)name {
     if (@available(iOS 10.3, *)) {
         UIApplication *app = UIApplication.sharedApplication;
@@ -563,18 +626,27 @@ static char kMvibeSettingsRowKey;
         }
         NSString *current = app.alternateIconName;
         BOOL same = (!name && !current) || (name && [current isEqualToString:name]);
-        if (same) return;
-        [app setAlternateIconName:name completionHandler:^(NSError *error) {
-            if (!error) return;
-            NSLog(@"[MaxVibe] setAlternateIconName error: %@", error);
+        void (^finish)(NSError *) = ^(NSError *error) {
+            if (error) {
+                NSLog(@"[MaxVibe] setAlternateIconName error: %@", error);
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"MaxVibe"
+                                                                               message:error.localizedDescription ?: @"Не удалось сменить иконку"
+                                                                        preferredStyle:UIAlertControllerStyleAlert];
+                    [ac addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+                    [[self settingsPresentingController] presentViewController:ac animated:YES completion:nil];
+                });
+                return;
+            }
             dispatch_async(dispatch_get_main_queue(), ^{
-                UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"MaxVibe"
-                                                                           message:error.localizedDescription ?: @"Не удалось сменить иконку"
-                                                                    preferredStyle:UIAlertControllerStyleAlert];
-                [ac addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
-                [[self settingsPresentingController] presentViewController:ac animated:YES completion:nil];
+                [self applyHomeScreenNameForIcon:name];
             });
-        }];
+        };
+        if (same) {
+            [self applyHomeScreenNameForIcon:name];
+            return;
+        }
+        [app setAlternateIconName:name completionHandler:finish];
     }
 }
 
@@ -582,7 +654,7 @@ static char kMvibeSettingsRowKey;
     [self dismissSettings];
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.28 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         UIAlertController *sheet = [UIAlertController alertControllerWithTitle:@"Сменить иконку"
-                                                                       message:@"Как на Android"
+                                                                       message:@"Оригинальная MAX меняет и имя на рабочем столе"
                                                                 preferredStyle:UIAlertControllerStyleActionSheet];
         [sheet addAction:[UIAlertAction actionWithTitle:@"Фирменная MaxVibe" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
             [self applyAlternateIcon:nil];
