@@ -117,6 +117,77 @@ def restore_executable_from_ipa(app: Path, source_ipa: Path, exe_name: str) -> N
     print(f"Restored {exe_name} from {source_ipa.name} ({len(raw)} bytes)")
 
 
+ALT_ICON_FILES = (
+    "AppIconOriginal@2x.png",
+    "AppIconOriginal@3x.png",
+    "AppIconZivert@2x.png",
+    "AppIconZivert@3x.png",
+    "AppIconMaxVibe2@2x.png",
+    "AppIconMaxVibe2@3x.png",
+)
+
+ALT_ICON_KEYS = {
+    "MaxOriginal": "AppIconOriginal",
+    "MaxZivert": "AppIconZivert",
+    "MaxVibe2": "AppIconMaxVibe2",
+}
+
+
+def find_icons_dir(dylib: Path) -> Path | None:
+    candidates = (
+        dylib.parent / "icons",
+        Path(__file__).resolve().parents[1] / "banner" / "icons",
+        dylib.parent,
+    )
+    for cand in candidates:
+        if (cand / ALT_ICON_FILES[0]).is_file():
+            return cand
+    return None
+
+
+def install_alternate_icons(app: Path, dylib: Path) -> None:
+    icons_dir = find_icons_dir(dylib)
+    if not icons_dir:
+        print("WARNING: alternate icon PNGs not found — skip CFBundleAlternateIcons")
+        return
+
+    copied = 0
+    for name in ALT_ICON_FILES:
+        src = icons_dir / name
+        if src.is_file():
+            shutil.copy2(src, app / name)
+            copied += 1
+    print(f"Copied {copied} alternate icon files from {icons_dir}")
+
+    try:
+        import plistlib
+    except Exception as exc:
+        print(f"WARNING: plistlib unavailable ({exc}) — skip Info.plist icon keys")
+        return
+
+    plist_path = app / "Info.plist"
+    with open(plist_path, "rb") as f:
+        info = plistlib.load(f)
+
+    alts = {
+        key: {
+            "CFBundleIconFiles": [file_stem],
+            "UIPrerenderedIcon": True,
+        }
+        for key, file_stem in ALT_ICON_KEYS.items()
+    }
+    for icons_key in ("CFBundleIcons", "CFBundleIcons~ipad"):
+        icons = info.get(icons_key)
+        if not isinstance(icons, dict):
+            icons = {}
+            info[icons_key] = icons
+        icons["CFBundleAlternateIcons"] = alts
+
+    with open(plist_path, "wb") as f:
+        plistlib.dump(info, f, sort_keys=False)
+    print("Info.plist CFBundleAlternateIcons:", ", ".join(ALT_ICON_KEYS))
+
+
 def copy_payload_files(app: Path, dylib: Path, png: Path) -> None:
     fw = app / "Frameworks"
     fw.mkdir(parents=True, exist_ok=True)
@@ -124,6 +195,7 @@ def copy_payload_files(app: Path, dylib: Path, png: Path) -> None:
     shutil.copy2(png, fw / BANNER_PNG)
     shutil.copy2(png, app / BANNER_PNG)
     print(f"Copied {DYLIB_NAME} and {BANNER_PNG} into {fw}")
+    install_alternate_icons(app, dylib)
 
 
 def pack_ipa(payload_parent: Path, out_ipa: Path) -> None:

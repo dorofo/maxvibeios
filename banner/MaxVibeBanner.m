@@ -434,7 +434,7 @@ static char kMvibeSettingsRowKey;
     [stack addArrangedSubview:[self settingsRowTitle:MaxVibeHideTypingEnabled() ? @"Не видно, что печатаю: вкл" : @"Не видно, что печатаю: выкл" subtitle:@"Собеседник не видит «печатает»" action:@selector(onSettingsToggleHideTyping) chevron:NO]];
     [stack addArrangedSubview:[self settingsRowTitle:MaxVibeHideVpnEnabled() ? @"Скрыть VPN: вкл" : @"Скрыть VPN: выкл" subtitle:@"Без баннера «отключите VPN»" action:@selector(onSettingsToggleHideVpn) chevron:NO]];
     [stack addArrangedSubview:[self settingsRowTitle:@"Показать баннер сейчас" subtitle:@"Сбросить таймер" action:@selector(onSettingsForceBanner) chevron:YES]];
-    [stack addArrangedSubview:[self settingsRowTitle:@"Сменить иконку" subtitle:@"Скоро" action:@selector(onSettingsStub) chevron:YES]];
+    [stack addArrangedSubview:[self settingsRowTitle:@"Сменить иконку" subtitle:[self iconSubtitle] action:@selector(onSettingsChangeIcon) chevron:YES]];
     [stack addArrangedSubview:[self settingsRowTitle:@"Аккаунты" subtitle:@"Скоро" action:@selector(onSettingsStub) chevron:YES]];
 
     [scroll addSubview:stack];
@@ -527,6 +527,85 @@ static char kMvibeSettingsRowKey;
     UIViewController *root = [self keyWindow].rootViewController;
     while (root.presentedViewController) root = root.presentedViewController;
     [root presentViewController:ac animated:YES completion:nil];
+}
+
+- (UIViewController *)settingsPresentingController {
+    UIViewController *root = [self keyWindow].rootViewController;
+    while (root.presentedViewController) root = root.presentedViewController;
+    return root;
+}
+
+- (NSString *)iconSubtitle {
+    if (@available(iOS 10.3, *)) {
+        if (!UIApplication.sharedApplication.supportsAlternateIcons) {
+            return @"Система не даёт сменить";
+        }
+        NSString *name = UIApplication.sharedApplication.alternateIconName;
+        if (!name.length) return @"Фирменная MaxVibe";
+        if ([name isEqualToString:@"MaxOriginal"]) return @"Оригинальная MAX";
+        if ([name isEqualToString:@"MaxZivert"]) return @"Zivert";
+        if ([name isEqualToString:@"MaxVibe2"]) return @"Фирменная 2";
+        return name;
+    }
+    return @"Нужен iOS 10.3+";
+}
+
+- (void)applyAlternateIcon:(NSString *)name {
+    if (@available(iOS 10.3, *)) {
+        UIApplication *app = UIApplication.sharedApplication;
+        if (!app.supportsAlternateIcons) {
+            UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"MaxVibe"
+                                                                       message:@"Смена иконки недоступна на этой установке"
+                                                                preferredStyle:UIAlertControllerStyleAlert];
+            [ac addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+            [[self settingsPresentingController] presentViewController:ac animated:YES completion:nil];
+            return;
+        }
+        NSString *current = app.alternateIconName;
+        BOOL same = (!name && !current) || (name && [current isEqualToString:name]);
+        if (same) return;
+        [app setAlternateIconName:name completionHandler:^(NSError *error) {
+            if (!error) return;
+            NSLog(@"[MaxVibe] setAlternateIconName error: %@", error);
+            dispatch_async(dispatch_get_main_queue(), ^{
+                UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"MaxVibe"
+                                                                           message:error.localizedDescription ?: @"Не удалось сменить иконку"
+                                                                    preferredStyle:UIAlertControllerStyleAlert];
+                [ac addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+                [[self settingsPresentingController] presentViewController:ac animated:YES completion:nil];
+            });
+        }];
+    }
+}
+
+- (void)onSettingsChangeIcon {
+    [self dismissSettings];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.28 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        UIAlertController *sheet = [UIAlertController alertControllerWithTitle:@"Сменить иконку"
+                                                                       message:@"Как на Android"
+                                                                preferredStyle:UIAlertControllerStyleActionSheet];
+        [sheet addAction:[UIAlertAction actionWithTitle:@"Фирменная MaxVibe" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+            [self applyAlternateIcon:nil];
+        }]];
+        [sheet addAction:[UIAlertAction actionWithTitle:@"Оригинальная MAX" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+            [self applyAlternateIcon:@"MaxOriginal"];
+        }]];
+        [sheet addAction:[UIAlertAction actionWithTitle:@"Zivert" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+            [self applyAlternateIcon:@"MaxZivert"];
+        }]];
+        [sheet addAction:[UIAlertAction actionWithTitle:@"Фирменная 2" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+            [self applyAlternateIcon:@"MaxVibe2"];
+        }]];
+        [sheet addAction:[UIAlertAction actionWithTitle:@"Отмена" style:UIAlertActionStyleCancel handler:nil]];
+        UIViewController *root = [self settingsPresentingController];
+        UIPopoverPresentationController *pop = sheet.popoverPresentationController;
+        if (pop) {
+            pop.sourceView = root.view;
+            pop.sourceRect = CGRectMake(CGRectGetMidX(root.view.bounds), CGRectGetMidY(root.view.bounds), 1, 1);
+            pop.permittedArrowDirections = 0;
+        }
+        [root presentViewController:sheet animated:YES completion:nil];
+    });
 }
 
 #pragma mark - Banner

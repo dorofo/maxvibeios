@@ -45,6 +45,8 @@ jobs:
           cp banner/banner_character.png dist/
           cp banner/entitlements.plist dist/
           cp scripts/inject_banner.py dist/
+          mkdir -p dist/icons
+          cp banner/icons/*.png dist/icons/
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
