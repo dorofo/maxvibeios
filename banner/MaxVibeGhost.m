@@ -161,10 +161,7 @@ static IMP gOrigBRPerform = NULL;
 static IMP gOrigBRWork = NULL;
 static IMP gOrigPresentVC = NULL;
 static IMP gOrigShowVC = NULL;
-static IMP gOrigAddChild = NULL;
 static IMP gOrigPossibleChatPk = NULL;
-static IMP gOrigSendMessages = NULL;
-static IMP gOrigSendDrafts = NULL;
 static IMP gOrigDestReply = NULL;
 static NSMutableDictionary *gOrigByKey = nil;
 
@@ -295,7 +292,7 @@ static id MVKvc(id obj, NSString *key) {
 
 static id MVChatPkFromObject(id obj) {
     if (!obj) return nil;
-    for (NSString *key in @[@"chatPk", @"pk", @"chatId", @"conversationId", @"serverId", @"id"]) {
+    for (NSString *key in @[@"chatPk", @"pk", @"chatId", @"conversationId", @"serverId"]) {
         id v = MVStringish(MVKvc(obj, key));
         if (v) return v;
     }
@@ -343,36 +340,12 @@ static id mvibe_destForReply(id self, SEL _cmd, id replyPk) {
     return dest;
 }
 
-static id mvibe_sendMessages(id self, SEL _cmd, id messages, id settings, id replyPk) {
-    id pk = nil;
-    @try { pk = mvibe_possibleChatPk(self, NSSelectorFromString(@"possibleChatPk")); } @catch (__unused NSException *ex) {}
-    MVGLog(@"sendMessages replyPk=%@ possibleChatPk=%@", replyPk, pk);
-    if (gOrigSendMessages) {
-        return ((id (*)(id, SEL, id, id, id))gOrigSendMessages)(self, _cmd, messages, settings, replyPk);
-    }
-    return nil;
-}
-
-static id mvibe_sendDrafts(id self, SEL _cmd, id drafts, id settings, id replyPk, id forward) {
-    id pk = nil;
-    @try { pk = mvibe_possibleChatPk(self, NSSelectorFromString(@"possibleChatPk")); } @catch (__unused NSException *ex) {}
-    MVGLog(@"sendDrafts replyPk=%@ possibleChatPk=%@", replyPk, pk);
-    if (gOrigSendDrafts) {
-        return ((id (*)(id, SEL, id, id, id, id))gOrigSendDrafts)(self, _cmd, drafts, settings, replyPk, forward);
-    }
-    return nil;
-}
-
 static void MVInstallReplyHooks(void) {
     Class handler = NSClassFromString(@"OKMChatHandler");
     MVHookOwn(handler, NSSelectorFromString(@"possibleChatPk"),
               (IMP)mvibe_possibleChatPk, &gOrigPossibleChatPk, @"possibleChatPk");
     MVHookOwn(handler, NSSelectorFromString(@"_sendoutDestinationForReplyMessagePk:"),
               (IMP)mvibe_destForReply, &gOrigDestReply, @"destForReply");
-    MVHookOwn(handler, NSSelectorFromString(@"sendMessages:withSettings:replyMessagePk:"),
-              (IMP)mvibe_sendMessages, &gOrigSendMessages, @"sendMessages");
-    MVHookOwn(handler, NSSelectorFromString(@"sendDrafts:withSettings:replyMessagePk:forwardContent:"),
-              (IMP)mvibe_sendDrafts, &gOrigSendDrafts, @"sendDrafts");
 }
 
 #pragma mark - VPN
@@ -417,30 +390,6 @@ static BOOL mvibe_ignoreVPN(id self, SEL _cmd) {
     if (orig) return ((BOOL (*)(id, SEL))orig)(self, _cmd);
     return NO;
 }
-static BOOL mvibe_shouldRestrict(id self, SEL _cmd) {
-    if (MaxVibeHideVpnEnabled()) return NO;
-    IMP orig = MVLoadOrig(self, _cmd);
-    if (orig) return ((BOOL (*)(id, SEL))orig)(self, _cmd);
-    return NO;
-}
-static BOOL mvibe_shouldRestrict1(id self, SEL _cmd, long long mode) {
-    if (MaxVibeHideVpnEnabled()) return NO;
-    IMP orig = MVLoadOrig(self, _cmd);
-    if (orig) return ((BOOL (*)(id, SEL, long long))orig)(self, _cmd, mode);
-    return NO;
-}
-static BOOL mvibe_messagingRestricted(id self, SEL _cmd) {
-    if (MaxVibeHideVpnEnabled()) return NO;
-    IMP orig = MVLoadOrig(self, _cmd);
-    if (orig) return ((BOOL (*)(id, SEL))orig)(self, _cmd);
-    return NO;
-}
-static BOOL mvibe_isRestrictionActive(id self, SEL _cmd) {
-    if (MaxVibeHideVpnEnabled()) return NO;
-    IMP orig = MVLoadOrig(self, _cmd);
-    if (orig) return ((BOOL (*)(id, SEL))orig)(self, _cmd);
-    return NO;
-}
 static void mvibe_presentVPN(id self, SEL _cmd, id action) {
     if (MaxVibeHideVpnEnabled()) {
         MVGLog(@"suppress presentVPNRestriction");
@@ -468,76 +417,21 @@ static void mvibe_vpnEnabledCompletion(id self, SEL _cmd, id completion) {
     if (orig) ((void (*)(id, SEL, id))orig)(self, _cmd, completion);
 }
 
-static void MVHideOverlayView(id view) {
+static void MVPassThroughOverlayView(id view) {
     if (![view isKindOfClass:[UIView class]]) return;
-    UIView *v = (UIView *)view;
-    v.hidden = YES;
-    v.alpha = 0;
-    v.userInteractionEnabled = NO;
-    [v removeFromSuperview];
+    ((UIView *)view).userInteractionEnabled = NO;
 }
 
-static void MVDisableRestrictionOnObject(id obj) {
+static void MVPassThroughOverlayOnObject(id obj) {
     if (!obj) return;
-    @try {
-        SEL setCompose = NSSelectorFromString(@"setComposeRestrictionActive:");
-        if ([obj respondsToSelector:setCompose]) {
-            IMP orig = MVLoadOrig(obj, setCompose);
-            if (orig) ((void (*)(id, SEL, BOOL))orig)(obj, setCompose, NO);
-            else ((void (*)(id, SEL, BOOL))objc_msgSend)(obj, setCompose, NO);
-        }
-        SEL setActive = NSSelectorFromString(@"setIsRestrictionActive:");
-        if ([obj respondsToSelector:setActive]) {
-            IMP orig = MVLoadOrig(obj, setActive);
-            if (orig) ((void (*)(id, SEL, BOOL))orig)(obj, setActive, NO);
-            else ((void (*)(id, SEL, BOOL))objc_msgSend)(obj, setActive, NO);
-        }
-        SEL setActive2 = NSSelectorFromString(@"setRestrictionActive:");
-        if ([obj respondsToSelector:setActive2]) {
-            IMP orig = MVLoadOrig(obj, setActive2);
-            if (orig) ((void (*)(id, SEL, BOOL))orig)(obj, setActive2, NO);
-            else ((void (*)(id, SEL, BOOL))objc_msgSend)(obj, setActive2, NO);
-        }
-        MVHideOverlayView(MVKvc(obj, @"restrictionOverlayView"));
-    } @catch (__unused NSException *ex) {}
+    @try { MVPassThroughOverlayView(MVKvc(obj, @"restrictionOverlayView")); }
+    @catch (__unused NSException *ex) {}
 }
 
-static void mvibe_setupRestrictionOverlay(id self, SEL _cmd) {
-    if (MaxVibeHideVpnEnabled()) {
-        MVDisableRestrictionOnObject(self);
-        return;
-    }
-    IMP orig = MVLoadOrig(self, _cmd);
-    if (orig) ((void (*)(id, SEL))orig)(self, _cmd);
-}
-static void mvibe_updateRestrictionOverlay(id self, SEL _cmd) {
-    if (MaxVibeHideVpnEnabled()) {
-        MVDisableRestrictionOnObject(self);
-        return;
-    }
-    IMP orig = MVLoadOrig(self, _cmd);
-    if (orig) ((void (*)(id, SEL))orig)(self, _cmd);
-}
-static void mvibe_setComposeRestrictionActive(id self, SEL _cmd, BOOL on) {
-    if (MaxVibeHideVpnEnabled()) on = NO;
-    IMP orig = MVLoadOrig(self, _cmd);
-    if (orig) ((void (*)(id, SEL, BOOL))orig)(self, _cmd, on);
-}
 static void mvibe_setRestrictionOverlayView(id self, SEL _cmd, id view) {
-    if (MaxVibeHideVpnEnabled()) {
-        MVHideOverlayView(view);
-        view = nil;
-    }
     IMP orig = MVLoadOrig(self, _cmd);
     if (orig) ((void (*)(id, SEL, id))orig)(self, _cmd, view);
-}
-static void mvibe_onTapRestrictionOverlay(id self, SEL _cmd) {
-    if (MaxVibeHideVpnEnabled()) {
-        MVDisableRestrictionOnObject(self);
-        return;
-    }
-    IMP orig = MVLoadOrig(self, _cmd);
-    if (orig) ((void (*)(id, SEL))orig)(self, _cmd);
+    if (MaxVibeHideVpnEnabled()) MVPassThroughOverlayView(view);
 }
 
 static BOOL MVClassLooksLikeAppVPN(Class cls) {
@@ -546,32 +440,6 @@ static BOOL MVClassLooksLikeAppVPN(Class cls) {
     if (!n) return NO;
     if (strstr(n, "NEVPN") || strstr(n, "NWTLS") || strstr(n, "NetworkExtension")) return NO;
     return strstr(n, "VPNRestriction") || strstr(n, "OMVPN") || strstr(n, "VPNWarning");
-}
-
-static BOOL MVClassIsSystemSkip(Class cls) {
-    if (!cls) return YES;
-    const char *n = class_getName(cls);
-    if (!n) return YES;
-    if (strstr(n, "NEVPN") || strstr(n, "NWTLS") || strstr(n, "NetworkExtension")) return YES;
-    return NO;
-}
-
-static BOOL MVClassHasComposerRestriction(Class cls) {
-    if (!cls || MVClassIsSystemSkip(cls)) return NO;
-    static SEL sels[6];
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        sels[0] = NSSelectorFromString(@"setupRestrictionOverlay");
-        sels[1] = NSSelectorFromString(@"updateRestrictionOverlayState");
-        sels[2] = NSSelectorFromString(@"updateComposeRestriction");
-        sels[3] = NSSelectorFromString(@"setComposeRestrictionActive:");
-        sels[4] = NSSelectorFromString(@"restrictionOverlayView");
-        sels[5] = NSSelectorFromString(@"onTapRestrictionOverlay");
-    });
-    for (int i = 0; i < 6; i++) {
-        if (MVOwnMethod(cls, sels[i])) return YES;
-    }
-    return NO;
 }
 
 static unsigned MVHookSelOnClass(Class cls, SEL sel, IMP replacement, NSString *tag) {
@@ -585,33 +453,15 @@ static unsigned MVHookSelOnClass(Class cls, SEL sel, IMP replacement, NSString *
     return 1;
 }
 
-static void MVHookComposerRestrictionSelsOnClass(Class cls) {
-    MVHookSelOnClass(cls, NSSelectorFromString(@"shouldIgnoreVPNRestriction"), (IMP)mvibe_ignoreVPN, @"shouldIgnoreVPNRestriction");
-    MVHookSelOnClass(cls, NSSelectorFromString(@"setupRestrictionOverlay"), (IMP)mvibe_setupRestrictionOverlay, @"setupRestrictionOverlay");
-    MVHookSelOnClass(cls, NSSelectorFromString(@"updateRestrictionOverlayState"), (IMP)mvibe_updateRestrictionOverlay, @"updateRestrictionOverlayState");
-    MVHookSelOnClass(cls, NSSelectorFromString(@"updateRestrictionOverlayFrame"), (IMP)mvibe_updateRestrictionOverlay, @"updateRestrictionOverlayFrame");
-    MVHookSelOnClass(cls, NSSelectorFromString(@"updateComposeRestriction"), (IMP)mvibe_updateRestrictionOverlay, @"updateComposeRestriction");
-    MVHookSelOnClass(cls, NSSelectorFromString(@"setComposeRestrictionActive:"), (IMP)mvibe_setComposeRestrictionActive, @"setComposeRestrictionActive");
-    MVHookSelOnClass(cls, NSSelectorFromString(@"setIsRestrictionActive:"), (IMP)mvibe_setComposeRestrictionActive, @"setIsRestrictionActive");
-    MVHookSelOnClass(cls, NSSelectorFromString(@"setRestrictionActive:"), (IMP)mvibe_setComposeRestrictionActive, @"setRestrictionActive");
-    MVHookSelOnClass(cls, NSSelectorFromString(@"isRestrictionActive"), (IMP)mvibe_isRestrictionActive, @"isRestrictionActive");
-    MVHookSelOnClass(cls, NSSelectorFromString(@"setRestrictionOverlayView:"), (IMP)mvibe_setRestrictionOverlayView, @"setRestrictionOverlayView");
-    MVHookSelOnClass(cls, NSSelectorFromString(@"onTapRestrictionOverlay"), (IMP)mvibe_onTapRestrictionOverlay, @"onTapRestrictionOverlay");
-    MVHookSelOnClass(cls, NSSelectorFromString(@"shouldRestrict"), (IMP)mvibe_shouldRestrict, @"shouldRestrict");
-    MVHookSelOnClass(cls, NSSelectorFromString(@"shouldRestrict:"), (IMP)mvibe_shouldRestrict1, @"shouldRestrict:");
-    MVHookSelOnClass(cls, NSSelectorFromString(@"shouldRestrictWithVpnDetectionMode:"), (IMP)mvibe_shouldRestrict1, @"shouldRestrictWithMode");
-}
-
 static void MVHookVPNSelsOnClass(Class cls) {
     MVHookSelOnClass(cls, NSSelectorFromString(@"isVPNDetected"), (IMP)mvibe_isVPNDetected, @"isVPNDetected");
     MVHookSelOnClass(cls, NSSelectorFromString(@"isVPNEnabled"), (IMP)mvibe_isVPNEnabled, @"isVPNEnabled");
     MVHookSelOnClass(cls, NSSelectorFromString(@"setIsVPNDetected:"), (IMP)mvibe_setVPNDetected, @"setIsVPNDetected");
+    MVHookSelOnClass(cls, NSSelectorFromString(@"shouldIgnoreVPNRestriction"), (IMP)mvibe_ignoreVPN, @"shouldIgnoreVPNRestriction");
     MVHookSelOnClass(cls, NSSelectorFromString(@"presentVPNRestrictionWithRestrictedAction:"), (IMP)mvibe_presentVPN, @"presentVPNRestriction");
     MVHookSelOnClass(cls, NSSelectorFromString(@"presentCallVPNRestrictionIfNeeded"), (IMP)mvibe_presentCallVPN, @"presentCallVPN");
     MVHookSelOnClass(cls, NSSelectorFromString(@"isVPNEnabledWithCompletion:"), (IMP)mvibe_vpnEnabledCompletion, @"isVPNEnabledWithCompletion");
-    MVHookSelOnClass(cls, NSSelectorFromString(@"messagingRestricted"), (IMP)mvibe_messagingRestricted, @"messagingRestricted");
-    MVHookSelOnClass(cls, NSSelectorFromString(@"callsRestricted"), (IMP)mvibe_messagingRestricted, @"callsRestricted");
-    MVHookComposerRestrictionSelsOnClass(cls);
+    MVHookSelOnClass(cls, NSSelectorFromString(@"setRestrictionOverlayView:"), (IMP)mvibe_setRestrictionOverlayView, @"setRestrictionOverlayView");
     Method rest = MVOwnMethod(cls, NSSelectorFromString(@"isRestricted"));
     if (rest && method_getNumberOfArguments(rest) == 2) {
         MVHookSelOnClass(cls, NSSelectorFromString(@"isRestricted"), (IMP)mvibe_isRestricted, @"isRestricted");
@@ -658,25 +508,14 @@ static void mvibe_showVC(id self, SEL _cmd, id vc, id sender) {
     if (gOrigShowVC) ((void (*)(id, SEL, id, id))gOrigShowVC)(self, _cmd, vc, sender);
 }
 
-static void mvibe_addChild(id self, SEL _cmd, id child) {
-    if (MaxVibeHideVpnEnabled() && MVIsVPNRestrictionController(child)) {
-        MVGLog(@"suppress addChild %@", NSStringFromClass([child class]));
-        return;
-    }
-    if (gOrigAddChild) ((void (*)(id, SEL, id))gOrigAddChild)(self, _cmd, child);
-}
-
 static void MVWalkStripVC(UIViewController *vc) {
     if (!vc) return;
-    MVDisableRestrictionOnObject(vc);
-    MVDisableRestrictionOnObject(MVKvc(vc, @"composeViewModel"));
-    MVDisableRestrictionOnObject(MVKvc(vc, @"viewModel"));
-    MVDisableRestrictionOnObject(MVKvc(vc, @"chatInput"));
-    MVDisableRestrictionOnObject(MVKvc(vc, @"sendoutViewModel"));
-    MVDisableRestrictionOnObject(MVKvc(vc, @"inputController"));
-    if (MVIsVPNRestrictionController(vc)) {
-        MVHideOverlayView(vc.view);
-    }
+    MVPassThroughOverlayOnObject(vc);
+    MVPassThroughOverlayOnObject(MVKvc(vc, @"composeViewModel"));
+    MVPassThroughOverlayOnObject(MVKvc(vc, @"viewModel"));
+    MVPassThroughOverlayOnObject(MVKvc(vc, @"chatInput"));
+    MVPassThroughOverlayOnObject(MVKvc(vc, @"sendoutViewModel"));
+    MVPassThroughOverlayOnObject(MVKvc(vc, @"inputController"));
     NSArray *children = [vc.childViewControllers copy];
     for (UIViewController *child in children) MVWalkStripVC(child);
     MVWalkStripVC(vc.presentedViewController);
@@ -684,7 +523,6 @@ static void MVWalkStripVC(UIViewController *vc) {
 
 static void MVStripComposerRestrictionUI(void) {
     if (!MaxVibeHideVpnEnabled()) return;
-    NSArray *windows = nil;
     if (@available(iOS 13.0, *)) {
         for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
             if (![scene isKindOfClass:[UIWindowScene class]]) continue;
@@ -693,27 +531,13 @@ static void MVStripComposerRestrictionUI(void) {
             }
         }
     }
-    windows = UIApplication.sharedApplication.windows;
-    for (UIWindow *w in windows) MVWalkStripVC(w.rootViewController);
+    for (UIWindow *w in UIApplication.sharedApplication.windows) {
+        MVWalkStripVC(w.rootViewController);
+    }
 }
 
 void MaxVibeStripVPNRestrictionUI(void) {
     MVStripComposerRestrictionUI();
-}
-
-static void MVDumpOwnMethods(Class cls, unsigned cap) {
-    if (!cls) return;
-    unsigned n = 0;
-    Method *list = class_copyMethodList(cls, &n);
-    unsigned shown = 0;
-    MVGLog(@"methods %@ count=%u", NSStringFromClass(cls), n);
-    for (unsigned i = 0; i < n && shown < cap; i++) {
-        NSString *name = NSStringFromSelector(method_getName(list[i]));
-        if ([name hasPrefix:@"."]) continue;
-        MVGLog(@"  %@", name);
-        shown++;
-    }
-    if (list) free(list);
 }
 
 static void MVInstallVPNPresentHooks(void) {
@@ -724,8 +548,6 @@ static void MVInstallVPNPresentHooks(void) {
                   (IMP)mvibe_presentVC, &gOrigPresentVC, @"presentViewController");
         MVHookOwn(vc, @selector(showViewController:sender:),
                   (IMP)mvibe_showVC, &gOrigShowVC, @"showViewController");
-        MVHookOwn(vc, @selector(addChildViewController:),
-                  (IMP)mvibe_addChild, &gOrigAddChild, @"addChildViewController");
     });
 }
 
@@ -739,45 +561,32 @@ static void MVInstallVPNHooks(void) {
         "OMVPNRestrictionsStatus",
         "OMVPNRestrictionBuilder",
         "VPNRestrictionBuilder",
-        "OMComposeContainerViewModel",
-        "OMChatSendoutViewModel",
-        "_TtC20OMLegacyChatSwiftKit11OMChatInput",
-        "_TtC12OKTTInputBar19OKTTInputController",
-        "_TtC12OKTTInputBar13OKTTInputView",
         NULL
     };
-    static dispatch_once_t dumpOnce;
-    dispatch_once(&dumpOnce, ^{
-        MVDumpOwnMethods(objc_getClass("_TtC13MessengerCore30OMVPNRestrictionStatusProvider"), 40);
-        MVDumpOwnMethods(objc_getClass("OMComposeContainerViewModel"), 40);
-        MVDumpOwnMethods(objc_getClass("_TtC20OMLegacyChatSwiftKit11OMChatInput"), 40);
-    });
     for (const char *const *p = kVPNClasses; p && *p; p++) {
         Class cls = objc_getClass(*p);
-        if (cls) {
-            MVHookVPNSelsOnClass(cls);
-            MVHookComposerRestrictionSelsOnClass(cls);
-        }
+        if (cls) MVHookVPNSelsOnClass(cls);
     }
     unsigned n = 0;
     Class *list = objc_copyClassList(&n);
     unsigned extra = 0;
     unsigned overlay = 0;
+    SEL ignoreSel = NSSelectorFromString(@"shouldIgnoreVPNRestriction");
+    SEL overlaySel = NSSelectorFromString(@"setRestrictionOverlayView:");
     for (unsigned i = 0; i < n; i++) {
         if (MVClassLooksLikeAppVPN(list[i])) {
             MVHookVPNSelsOnClass(list[i]);
             extra++;
         }
-        if (MVClassHasComposerRestriction(list[i])) {
-            MVHookComposerRestrictionSelsOnClass(list[i]);
-            overlay++;
-        } else if (MVOwnMethod(list[i], NSSelectorFromString(@"shouldIgnoreVPNRestriction"))) {
-            MVHookSelOnClass(list[i], NSSelectorFromString(@"shouldIgnoreVPNRestriction"),
-                             (IMP)mvibe_ignoreVPN, @"shouldIgnoreVPNRestriction");
+        if (MVOwnMethod(list[i], ignoreSel)) {
+            MVHookSelOnClass(list[i], ignoreSel, (IMP)mvibe_ignoreVPN, @"shouldIgnoreVPNRestriction");
+        }
+        if (MVOwnMethod(list[i], overlaySel)) {
+            overlay += MVHookSelOnClass(list[i], overlaySel, (IMP)mvibe_setRestrictionOverlayView, @"setRestrictionOverlayView");
         }
     }
     if (list) free(list);
-    MVGLog(@"VPN class-filter matched %u overlay-owners %u", extra, overlay);
+    MVGLog(@"VPN class-filter matched %u overlay-setters %u", extra, overlay);
     MVInstallVPNPresentHooks();
     if (MaxVibeHideVpnEnabled()) {
         dispatch_async(dispatch_get_main_queue(), ^{
