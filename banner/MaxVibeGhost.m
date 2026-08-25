@@ -11,12 +11,10 @@
  * hide-read    — subclass-only override of OKMReadMarkTask perform (do NOT enqueue-drop)
  * hide-typing  — no-op typing sender start/timer + TypingService userDidType
  * hide-online  — force ping interactive=NO on OKMMessengerClient (Android tgc)
- * hide-vpn     — composer overlay off + isRestricted=NO + shouldIgnore
- * replies      — keep replyMessagePk for dialogs that still have a chat pk
+ * hide-vpn     — isRestricted=NO + shouldIgnore + do not present restriction UI
  *
  * Never hook sendData: / OKMBaseTask perform (reply crash + lost reply link).
  * Never hook serializeBlock (sticker panel).
- * Never enqueue-drop (strips reply from the send batch).
  */
 
 static NSString * const kPrefOnline = @"mvibe_hide_online_enabled";
@@ -29,8 +27,6 @@ static BOOL gRtRead = NO;
 static BOOL gRtTyping = NO;
 static BOOL gRtVpn = NO;
 static BOOL gRtLoaded = NO;
-
-static void MVStripComposerRestrictionUI(void);
 
 #pragma mark - Prefs + runtime
 
@@ -64,11 +60,6 @@ void MaxVibeSetHideTypingEnabled(BOOL enabled) {
 void MaxVibeSetHideVpnEnabled(BOOL enabled) {
     gRtLoaded = YES; gRtVpn = enabled;
     [[NSUserDefaults standardUserDefaults] setBool:enabled forKey:kPrefVpn];
-    if (enabled) {
-        dispatch_async(dispatch_get_main_queue(), ^{
-            MVStripComposerRestrictionUI();
-        });
-    }
 }
 
 #pragma mark - Log
@@ -161,8 +152,6 @@ static IMP gOrigBRPerform = NULL;
 static IMP gOrigBRWork = NULL;
 static IMP gOrigPresentVC = NULL;
 static IMP gOrigShowVC = NULL;
-static IMP gOrigPossibleChatPk = NULL;
-static IMP gOrigDestReply = NULL;
 static NSMutableDictionary *gOrigByKey = nil;
 
 static NSString *MVOrigKey(Class cls, SEL sel) {
@@ -274,80 +263,6 @@ static void mvibe_setInteractive(id self, SEL _cmd, BOOL interactive) {
     if (gOrigSetInteractive) ((void (*)(id, SEL, BOOL))gOrigSetInteractive)(self, _cmd, interactive);
 }
 
-#pragma mark - Replies (dialog without chat pk)
-
-static id MVStringish(id v) {
-    if (!v || [v isEqual:[NSNull null]]) return nil;
-    if ([v isKindOfClass:[NSString class]]) {
-        return [(NSString *)v length] ? v : nil;
-    }
-    if ([v isKindOfClass:[NSNumber class]]) return [v description];
-    return nil;
-}
-
-static id MVKvc(id obj, NSString *key) {
-    if (!obj || !key.length) return nil;
-    @try { return [obj valueForKey:key]; } @catch (__unused NSException *ex) { return nil; }
-}
-
-static id MVChatPkFromObject(id obj) {
-    if (!obj) return nil;
-    for (NSString *key in @[@"chatPk", @"pk", @"chatId", @"conversationId", @"serverId"]) {
-        id v = MVStringish(MVKvc(obj, key));
-        if (v) return v;
-    }
-    return nil;
-}
-
-static id MVFallbackChatPk(id handler) {
-    id pk = MVChatPkFromObject(handler);
-    if (pk) return pk;
-    for (NSString *key in @[@"chat", @"currentChat", @"conversation"]) {
-        pk = MVChatPkFromObject(MVKvc(handler, key));
-        if (pk) return pk;
-    }
-    @try {
-        if ([handler respondsToSelector:NSSelectorFromString(@"dialogInterlocutor")]) {
-            pk = MVChatPkFromObject(((id (*)(id, SEL))objc_msgSend)(handler, NSSelectorFromString(@"dialogInterlocutor")));
-            if (pk) return pk;
-        }
-    } @catch (__unused NSException *ex) {}
-    return nil;
-}
-
-static id mvibe_possibleChatPk(id self, SEL _cmd) {
-    id pk = nil;
-    if (gOrigPossibleChatPk) pk = ((id (*)(id, SEL))gOrigPossibleChatPk)(self, _cmd);
-    if (MVStringish(pk)) return pk;
-    id fb = MVFallbackChatPk(self);
-    if (fb) MVGLog(@"possibleChatPk fallback %@", fb);
-    return fb;
-}
-
-static id mvibe_destForReply(id self, SEL _cmd, id replyPk) {
-    id dest = nil;
-    if (gOrigDestReply) dest = ((id (*)(id, SEL, id))gOrigDestReply)(self, _cmd, replyPk);
-    if (!replyPk || !dest) return dest;
-    @try {
-        if (!MVStringish(MVKvc(dest, @"chatPk"))) {
-            id pk = mvibe_possibleChatPk(self, NSSelectorFromString(@"possibleChatPk"));
-            if (pk) {
-                [dest setValue:pk forKey:@"chatPk"];
-                MVGLog(@"reply dest filled chatPk=%@", pk);
-            }
-        }
-    } @catch (__unused NSException *ex) {}
-    return dest;
-}
-
-static void MVInstallReplyHooks(void) {
-    Class handler = NSClassFromString(@"OKMChatHandler");
-    MVHookOwn(handler, NSSelectorFromString(@"possibleChatPk"),
-              (IMP)mvibe_possibleChatPk, &gOrigPossibleChatPk, @"possibleChatPk");
-    MVHookOwn(handler, NSSelectorFromString(@"_sendoutDestinationForReplyMessagePk:"),
-              (IMP)mvibe_destForReply, &gOrigDestReply, @"destForReply");
-}
-
 #pragma mark - VPN
 
 static BOOL mvibe_isVPNDetected(id self, SEL _cmd) {
@@ -417,23 +332,6 @@ static void mvibe_vpnEnabledCompletion(id self, SEL _cmd, id completion) {
     if (orig) ((void (*)(id, SEL, id))orig)(self, _cmd, completion);
 }
 
-static void MVPassThroughOverlayView(id view) {
-    if (![view isKindOfClass:[UIView class]]) return;
-    ((UIView *)view).userInteractionEnabled = NO;
-}
-
-static void MVPassThroughOverlayOnObject(id obj) {
-    if (!obj) return;
-    @try { MVPassThroughOverlayView(MVKvc(obj, @"restrictionOverlayView")); }
-    @catch (__unused NSException *ex) {}
-}
-
-static void mvibe_setRestrictionOverlayView(id self, SEL _cmd, id view) {
-    IMP orig = MVLoadOrig(self, _cmd);
-    if (orig) ((void (*)(id, SEL, id))orig)(self, _cmd, view);
-    if (MaxVibeHideVpnEnabled()) MVPassThroughOverlayView(view);
-}
-
 static BOOL MVClassLooksLikeAppVPN(Class cls) {
     if (!cls) return NO;
     const char *n = class_getName(cls);
@@ -461,7 +359,6 @@ static void MVHookVPNSelsOnClass(Class cls) {
     MVHookSelOnClass(cls, NSSelectorFromString(@"presentVPNRestrictionWithRestrictedAction:"), (IMP)mvibe_presentVPN, @"presentVPNRestriction");
     MVHookSelOnClass(cls, NSSelectorFromString(@"presentCallVPNRestrictionIfNeeded"), (IMP)mvibe_presentCallVPN, @"presentCallVPN");
     MVHookSelOnClass(cls, NSSelectorFromString(@"isVPNEnabledWithCompletion:"), (IMP)mvibe_vpnEnabledCompletion, @"isVPNEnabledWithCompletion");
-    MVHookSelOnClass(cls, NSSelectorFromString(@"setRestrictionOverlayView:"), (IMP)mvibe_setRestrictionOverlayView, @"setRestrictionOverlayView");
     Method rest = MVOwnMethod(cls, NSSelectorFromString(@"isRestricted"));
     if (rest && method_getNumberOfArguments(rest) == 2) {
         MVHookSelOnClass(cls, NSSelectorFromString(@"isRestricted"), (IMP)mvibe_isRestricted, @"isRestricted");
@@ -486,7 +383,7 @@ static void MVHookVPNSelsOnClass(Class cls) {
 static BOOL MVIsVPNRestrictionController(id vc) {
     if (!vc) return NO;
     NSString *n = NSStringFromClass([vc class]);
-    return [n containsString:@"VPNRestriction"] || [n containsString:@"VpnConnectedWarning"];
+    return [n containsString:@"VPNRestriction"];
 }
 
 static void mvibe_presentVC(id self, SEL _cmd, id vc, BOOL animated, id completion) {
@@ -506,38 +403,6 @@ static void mvibe_showVC(id self, SEL _cmd, id vc, id sender) {
         return;
     }
     if (gOrigShowVC) ((void (*)(id, SEL, id, id))gOrigShowVC)(self, _cmd, vc, sender);
-}
-
-static void MVWalkStripVC(UIViewController *vc) {
-    if (!vc) return;
-    MVPassThroughOverlayOnObject(vc);
-    MVPassThroughOverlayOnObject(MVKvc(vc, @"composeViewModel"));
-    MVPassThroughOverlayOnObject(MVKvc(vc, @"viewModel"));
-    MVPassThroughOverlayOnObject(MVKvc(vc, @"chatInput"));
-    MVPassThroughOverlayOnObject(MVKvc(vc, @"sendoutViewModel"));
-    MVPassThroughOverlayOnObject(MVKvc(vc, @"inputController"));
-    NSArray *children = [vc.childViewControllers copy];
-    for (UIViewController *child in children) MVWalkStripVC(child);
-    MVWalkStripVC(vc.presentedViewController);
-}
-
-static void MVStripComposerRestrictionUI(void) {
-    if (!MaxVibeHideVpnEnabled()) return;
-    if (@available(iOS 13.0, *)) {
-        for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
-            if (![scene isKindOfClass:[UIWindowScene class]]) continue;
-            for (UIWindow *w in ((UIWindowScene *)scene).windows) {
-                MVWalkStripVC(w.rootViewController);
-            }
-        }
-    }
-    for (UIWindow *w in UIApplication.sharedApplication.windows) {
-        MVWalkStripVC(w.rootViewController);
-    }
-}
-
-void MaxVibeStripVPNRestrictionUI(void) {
-    MVStripComposerRestrictionUI();
 }
 
 static void MVInstallVPNPresentHooks(void) {
@@ -570,33 +435,21 @@ static void MVInstallVPNHooks(void) {
     unsigned n = 0;
     Class *list = objc_copyClassList(&n);
     unsigned extra = 0;
-    unsigned overlay = 0;
-    SEL ignoreSel = NSSelectorFromString(@"shouldIgnoreVPNRestriction");
-    SEL overlaySel = NSSelectorFromString(@"setRestrictionOverlayView:");
     for (unsigned i = 0; i < n; i++) {
-        if (MVClassLooksLikeAppVPN(list[i])) {
-            MVHookVPNSelsOnClass(list[i]);
-            extra++;
-        }
-        if (MVOwnMethod(list[i], ignoreSel)) {
-            MVHookSelOnClass(list[i], ignoreSel, (IMP)mvibe_ignoreVPN, @"shouldIgnoreVPNRestriction");
-        }
-        if (MVOwnMethod(list[i], overlaySel)) {
-            overlay += MVHookSelOnClass(list[i], overlaySel, (IMP)mvibe_setRestrictionOverlayView, @"setRestrictionOverlayView");
-        }
+        if (!MVClassLooksLikeAppVPN(list[i])) continue;
+        MVHookVPNSelsOnClass(list[i]);
+        extra++;
     }
     if (list) free(list);
-    MVGLog(@"VPN class-filter matched %u overlay-setters %u", extra, overlay);
+    MVGLog(@"VPN class-filter matched %u", extra);
     MVInstallVPNPresentHooks();
-    if (MaxVibeHideVpnEnabled()) {
-        dispatch_async(dispatch_get_main_queue(), ^{
-            MVStripComposerRestrictionUI();
-        });
-    }
 }
 
 void MaxVibeRefreshVPNHooks(void) {
     MVInstallVPNHooks();
+}
+
+void MaxVibeStripVPNRestrictionUI(void) {
 }
 
 #pragma mark - Install
@@ -639,9 +492,8 @@ void MaxVibeInstallGhost(void) {
         MVHookOwn(client, NSSelectorFromString(@"setInteractive:"),
                   (IMP)mvibe_setInteractive, &gOrigSetInteractive, @"setInteractive");
 
-        MVInstallReplyHooks();
         MVInstallVPNHooks();
 
-        MVGLog(@"install done (no BaseTask perform, no sendData, no enqueue drop)");
+        MVGLog(@"install done (no BaseTask perform, no sendData)");
     });
 }
