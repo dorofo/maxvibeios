@@ -8,7 +8,7 @@
 /*
  * MaxVibe privacy toggles (default OFF, runtime flag is source of truth).
  *
- * hide-read    — subclass-only override of OKMReadMarkTask perform (do NOT enqueue-drop)
+ * hide-read    — not hooked (ReadMark perform is a RAC signal; void override crashes takeUntil:)
  * hide-typing  — no-op typing sender start/timer + TypingService userDidType
  * hide-online  — force ping interactive=NO on OKMMessengerClient (Android tgc)
  * hide-vpn     — isRestricted=NO + shouldIgnore + do not present restriction UI
@@ -114,29 +114,6 @@ static BOOL MVHookOwn(Class cls, SEL sel, IMP replacement, IMP *origOut, NSStrin
     return YES;
 }
 
-static BOOL MVIsReadTask(id task) {
-    if (!task) return NO;
-    NSString *cls = NSStringFromClass([task class]);
-    return [cls hasSuffix:@"ReadMarkTask"] || [cls isEqualToString:@"OKMBatchReadLogTask"];
-}
-
-/** Android allows SET_AS_UNREAD through ghost. Do NOT treat an unread-count as that flag. */
-static BOOL MVReadTaskIsUnreadMark(id task) {
-    if (!task) return NO;
-    @try {
-        for (NSString *key in @[@"markedAsUnread", @"setAsUnread"]) {
-            id flagged = [task valueForKey:key];
-            if ([flagged respondsToSelector:@selector(boolValue)] && [flagged boolValue]) return YES;
-        }
-        id mt = [task valueForKey:@"markType"];
-        if (!mt) return NO;
-        NSString *s = [[mt description] uppercaseString];
-        if ([s containsString:@"SET_AS_UNREAD"]) return YES;
-        if ([s isEqualToString:@"UNREAD"] || [s isEqualToString:@"MARK_AS_UNREAD"]) return YES;
-    } @catch (__unused NSException *ex) {}
-    return NO;
-}
-
 #pragma mark - Orig IMPs
 
 static IMP gOrigStartTyping = NULL;
@@ -146,8 +123,6 @@ static IMP gOrigSendTypingNotif = NULL;
 static IMP gOrigPingInteractive = NULL;
 static IMP gOrigSendPingIfNeeded = NULL;
 static IMP gOrigSetInteractive = NULL;
-static IMP gOrigRMPerform = NULL;
-static IMP gOrigBRPerform = NULL;
 static IMP gOrigPresentVC = NULL;
 static IMP gOrigShowVC = NULL;
 static NSMutableDictionary *gOrigByKey = nil;
@@ -189,45 +164,6 @@ static void mvibe_userDidType(id self, SEL _cmd, id chat, long long type) {
 static void mvibe_sendTypingNotif(id self, SEL _cmd, id arg) {
     if (MaxVibeHideTypingEnabled()) return;
     if (gOrigSendTypingNotif) ((void (*)(id, SEL, id))gOrigSendTypingNotif)(self, _cmd, arg);
-}
-
-#pragma mark - Read (subclass override only — never touch enqueue or BaseTask)
-
-static BOOL MVShouldBlockReadTask(id task) {
-    return MaxVibeHideReadEnabled() && MVIsReadTask(task) && !MVReadTaskIsUnreadMark(task);
-}
-
-static BOOL MVAddSubclassHook(Class cls, SEL sel, IMP imp, IMP *origOut, NSString *tag) {
-    if (!cls || !sel) return NO;
-    Method own = MVOwnMethod(cls, sel);
-    if (own) {
-        if (origOut) *origOut = method_getImplementation(own);
-        method_setImplementation(own, imp);
-        MVGLog(@"%@: own %@", tag, NSStringFromClass(cls));
-        return YES;
-    }
-    Method inherited = class_getInstanceMethod(cls, sel);
-    if (!inherited) {
-        MVGLog(@"%@: no method %@", tag, NSStringFromClass(cls));
-        return NO;
-    }
-    if (origOut) *origOut = method_getImplementation(inherited);
-    const char *enc = method_getTypeEncoding(inherited);
-    if (class_addMethod(cls, sel, imp, enc ? enc : "v@:")) {
-        MVGLog(@"%@: subclass override %@", tag, NSStringFromClass(cls));
-        return YES;
-    }
-    MVGLog(@"%@: addMethod failed %@", tag, NSStringFromClass(cls));
-    return NO;
-}
-
-static void mvibe_rmPerform(id self, SEL _cmd) {
-    if (MVShouldBlockReadTask(self)) return;
-    if (gOrigRMPerform) ((void (*)(id, SEL))gOrigRMPerform)(self, _cmd);
-}
-static void mvibe_brPerform(id self, SEL _cmd) {
-    if (MVShouldBlockReadTask(self)) return;
-    if (gOrigBRPerform) ((void (*)(id, SEL))gOrigBRPerform)(self, _cmd);
 }
 
 #pragma mark - Online / ping
@@ -452,13 +388,6 @@ void MaxVibeInstallGhost(void) {
         MVHookOwn(typingSvc, NSSelectorFromString(@"sendTypingNotificationIfNeeded:"),
                   (IMP)mvibe_sendTypingNotif, &gOrigSendTypingNotif, @"sendTypingNotificationIfNeeded");
 
-        Class readMark = NSClassFromString(@"OKMReadMarkTask");
-        MVAddSubclassHook(readMark, NSSelectorFromString(@"perform"),
-                          (IMP)mvibe_rmPerform, &gOrigRMPerform, @"ReadMark perform");
-        Class batchRead = NSClassFromString(@"OKMBatchReadLogTask");
-        MVAddSubclassHook(batchRead, NSSelectorFromString(@"perform"),
-                          (IMP)mvibe_brPerform, &gOrigBRPerform, @"BatchRead perform");
-
         Class client = NSClassFromString(@"OKMMessengerClient");
         MVHookOwn(client, NSSelectorFromString(@"_reschedulePingTimerWithForInteractive:"),
                   (IMP)mvibe_pingInteractive, &gOrigPingInteractive, @"ping interactive");
@@ -469,6 +398,6 @@ void MaxVibeInstallGhost(void) {
 
         MVInstallVPNHooks();
 
-        MVGLog(@"install done (no BaseTask perform, no sendData)");
+        MVGLog(@"install done (no BaseTask/ReadMark perform, no sendData)");
     });
 }
