@@ -46,6 +46,8 @@ static IMP gOrigMsgTextContent = NULL;
 static SEL gSelHandleDeleted;
 static SEL gSelMessagesDeleted;
 static SEL gSelSaveMessage;
+/* KVC on text/messageText/textContent re-enters these hooks and overflows the stack. */
+static _Thread_local int gTextHookDepth;
 
 #pragma mark - Prefs
 
@@ -309,20 +311,30 @@ static BOOL MVIsRemovedStatus(NSInteger st) {
     return st == gRemovedStatus || st == kStatusRemovedDefault;
 }
 
+static NSString *MVStringFromTextValue(id value) {
+    if ([value isKindOfClass:[NSString class]]) return value;
+    if (!value) return nil;
+    @try {
+        id t = [value valueForKey:@"text"];
+        if ([t isKindOfClass:[NSString class]]) return t;
+    } @catch (__unused NSException *ex) {}
+    return nil;
+}
+
+static id MVOrigTextValue(id msg, IMP orig, SEL sel) {
+    if (!msg || !orig) return nil;
+    return ((id (*)(id, SEL))orig)(msg, sel);
+}
+
+/** Never use KVC for text/messageText/textContent — those getters are hooked. */
 static NSString *MVPlainTextOfMessage(id msg) {
     @try {
-        id textObj = [msg valueForKey:@"text"];
-        if ([textObj isKindOfClass:[NSString class]]) return textObj;
-        if (textObj) {
-            id t = [textObj valueForKey:@"text"];
-            if ([t isKindOfClass:[NSString class]]) return t;
-        }
-        id mt = [msg valueForKey:@"messageText"];
-        if ([mt isKindOfClass:[NSString class]]) return mt;
-        if (mt) {
-            id t = [mt valueForKey:@"text"];
-            if ([t isKindOfClass:[NSString class]]) return t;
-        }
+        NSString *s = MVStringFromTextValue(MVOrigTextValue(msg, gOrigMsgText, NSSelectorFromString(@"text")));
+        if (s) return s;
+        s = MVStringFromTextValue(MVOrigTextValue(msg, gOrigMsgMessageText, NSSelectorFromString(@"messageText")));
+        if (s) return s;
+        s = MVStringFromTextValue(MVOrigTextValue(msg, gOrigMsgTextContent, NSSelectorFromString(@"textContent")));
+        if (s) return s;
     } @catch (__unused NSException *ex) {}
     return nil;
 }
@@ -696,22 +708,34 @@ static void mvibe_saveMessage(id self, SEL _cmd, id msg) {
     if (MaxVibeAntiDeleteEnabled()) MVCacheLiveMessage(msg);
 }
 
+static id MVHookedTextGetter(id self, SEL _cmd, IMP origImp) {
+    if (!origImp) return nil;
+    if (gTextHookDepth > 0) {
+        return ((id (*)(id, SEL))origImp)(self, _cmd);
+    }
+    gTextHookDepth++;
+    id orig = ((id (*)(id, SEL))origImp)(self, _cmd);
+    id result = orig;
+    @try {
+        if (MaxVibeAntiDeleteEnabled()) MVCacheTextFromRenderedValue(self, orig);
+        result = MVRenderTaggedValue(self, orig);
+    } @catch (__unused NSException *ex) {
+        result = orig;
+    }
+    gTextHookDepth--;
+    return result;
+}
+
 static id mvibe_messageText(id self, SEL _cmd) {
-    id orig = gOrigMsgMessageText ? ((id (*)(id, SEL))gOrigMsgMessageText)(self, _cmd) : nil;
-    if (MaxVibeAntiDeleteEnabled()) MVCacheTextFromRenderedValue(self, orig);
-    return MVRenderTaggedValue(self, orig);
+    return MVHookedTextGetter(self, _cmd, gOrigMsgMessageText);
 }
 
 static id mvibe_text(id self, SEL _cmd) {
-    id orig = gOrigMsgText ? ((id (*)(id, SEL))gOrigMsgText)(self, _cmd) : nil;
-    if (MaxVibeAntiDeleteEnabled()) MVCacheTextFromRenderedValue(self, orig);
-    return MVRenderTaggedValue(self, orig);
+    return MVHookedTextGetter(self, _cmd, gOrigMsgText);
 }
 
 static id mvibe_textContent(id self, SEL _cmd) {
-    id orig = gOrigMsgTextContent ? ((id (*)(id, SEL))gOrigMsgTextContent)(self, _cmd) : nil;
-    if (MaxVibeAntiDeleteEnabled()) MVCacheTextFromRenderedValue(self, orig);
-    return MVRenderTaggedValue(self, orig);
+    return MVHookedTextGetter(self, _cmd, gOrigMsgTextContent);
 }
 
 static void mvibe_handleDeletedMessages(id self, SEL _cmd, id messages, id chatId) {
